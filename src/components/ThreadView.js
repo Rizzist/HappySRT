@@ -3,6 +3,11 @@ import styled from "styled-components";
 import TutorialThread from "./TutorialThread";
 import ThreadComposer from "./ThreadComposer";
 import { useThreads } from "../contexts/threadsContext";
+import ChatTimeline from "./ChatTimeline";
+
+function safeArr(x) {
+  return Array.isArray(x) ? x : [];
+}
 
 export default function ThreadView({ thread, loading }) {
   const { renameThread, deleteThread } = useThreads();
@@ -22,6 +27,8 @@ export default function ThreadView({ thread, loading }) {
   }
 
   const isDefault = thread.id === "default";
+  const chatItems = safeArr(thread?.chatItems);
+  const hasChatItems = chatItems.length > 0;
 
   const onRename = async () => {
     const next = window.prompt("Rename thread:", thread?.title || "");
@@ -62,6 +69,8 @@ export default function ThreadView({ thread, loading }) {
       <Body>
         {isDefault ? (
           <TutorialThread />
+        ) : hasChatItems ? (
+          <ChatTimeline thread={thread} showEmpty={false} />
         ) : (
           <Empty>
             <EmptyCard>
@@ -81,7 +90,6 @@ export default function ThreadView({ thread, loading }) {
       </Body>
 
       {!isDefault && <ThreadComposer thread={thread} />}
-
     </Wrap>
   );
 }
@@ -195,8 +203,8 @@ const SmallButton = styled.button`
 `;
 
 const DangerButton = styled.button`
-  border: 1px solid rgba(239,68,68,0.25);
-  background: rgba(239,68,68,0.1);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  background: rgba(239, 68, 68, 0.1);
   color: var(--accent);
   border-radius: 12px;
   padding: 8px 10px;
@@ -204,6 +212,6 @@ const DangerButton = styled.button`
   cursor: pointer;
 
   &:hover {
-    background: rgba(239,68,68,0.14);
+    background: rgba(239, 68, 68, 0.14);
   }
 `;
