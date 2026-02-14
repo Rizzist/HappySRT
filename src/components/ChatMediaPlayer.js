@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import { getLocalMedia, putLocalMedia } from "../lib/mediaStore";
+import { getLocalMediaMeta, putLocalMediaMeta } from "../lib/mediaMetaStore";
 import { getMediaIndex } from "../lib/mediaIndexStore";
 import { useAuth } from "../contexts/AuthContext";
 import { useThreads } from "../contexts/threadsContext";
@@ -10,17 +11,27 @@ function isBrowser() {
 }
 
 function pickPlayableUrl(media) {
-  return media?.playbackUrl || media?.signedUrl || (media?.sourceType === "url" ? media?.url : "") || "";
+  return (
+    media?.playbackUrl ||
+    media?.signedUrl ||
+    (media?.sourceType === "url" ? media?.url : "") ||
+    ""
+  );
 }
 
 function pickClientFileId(media, item) {
-  return media?.clientFileId || media?.client_file_id || item?.clientFileId || item?.client_file_id || null;
+  return (
+    media?.clientFileId ||
+    media?.client_file_id ||
+    item?.clientFileId ||
+    item?.client_file_id ||
+    null
+  );
 }
 
 function isVideoLike(mime) {
   return String(mime || "").startsWith("video/");
 }
-
 function isAudioLike(mime) {
   return String(mime || "").startsWith("audio/");
 }
@@ -31,14 +42,55 @@ async function fetchBlob(url) {
   return res.blob();
 }
 
+// Cache server mp3 under a DIFFERENT key than the original upload
+const SERVER_VARIANT_SUFFIX = "::server_mp3";
+
+function serverVariantId(clientFileId) {
+  const id = String(clientFileId || "");
+  return id ? `${id}${SERVER_VARIANT_SUFFIX}` : null;
+}
+
+async function findLocalAcrossScopes({ scopes, threadId, clientFileId }) {
+  const origId = clientFileId ? String(clientFileId) : null;
+  const srvId = serverVariantId(clientFileId);
+
+  // Original always wins
+  const idsToTry = [origId, srvId].filter(Boolean);
+
+  for (const id of idsToTry) {
+    for (const sc of scopes) {
+      try {
+        const blobOrFile = await getLocalMedia(sc, threadId, id);
+
+        if (blobOrFile instanceof Blob) {
+          let meta = null;
+          try {
+            meta = await getLocalMediaMeta(sc, threadId, id);
+          } catch {}
+
+          return {
+            blob: blobOrFile,
+            scope: sc,
+            meta,
+            storedId: id,
+            variant: id === origId ? "original" : "server",
+          };
+        }
+      } catch {}
+    }
+  }
+
+  return null;
+}
+
 export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, className }) {
   const { user, isAnonymous } = useAuth();
   const { requestMediaUrl, wsStatus } = useThreads();
 
   const scope = useMemo(() => {
-    if (!user) return null;
-    return isAnonymous ? "guest" : user.$id;
-  }, [user, isAnonymous]);
+    if (isAnonymous) return "guest";
+    return user?.$id ? String(user.$id) : null;
+  }, [user?.$id, isAnonymous]);
 
   const chatItemId = String(item?.chatItemId || "");
   const mimeHint = String(media?.mime || "");
@@ -47,22 +99,42 @@ export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, 
   const [sourceKind, setSourceKind] = useState("none"); // local | remote | none
   const [error, setError] = useState(null);
   const [loadedMime, setLoadedMime] = useState("");
-
-  // stages: idle | waiting_ws | requesting_url | downloading
-  const [stage, setStage] = useState("idle");
+  const [stage, setStage] = useState("idle"); // idle | resolving_id | waiting_ws | requesting_url | downloading
 
   const elRef = useRef(null);
+
+  // Object URL lifecycle
   const objectUrlRef = useRef(null);
+  const revokeObjectUrl = (url) => {
+    if (!url) return;
+    try {
+      URL.revokeObjectURL(url);
+    } catch {}
+  };
 
-  // important: only mark requested if the WS send actually succeeded
-  const requestedRemoteRef = useRef(false);
+  const setObjectSrcFromBlob = (blob, { mimeFallback } = {}) => {
+    const nextUrl = URL.createObjectURL(blob);
+    const prevUrl = objectUrlRef.current;
 
-  const [resolvedClientFileId, setResolvedClientFileId] = useState(null);
+    objectUrlRef.current = nextUrl;
+    setSrc(nextUrl);
+    setSourceKind("local");
+
+    const effectiveMime = String(blob?.type || mimeFallback || "");
+    if (effectiveMime && effectiveMime !== loadedMime) setLoadedMime(effectiveMime);
+
+    if (prevUrl && prevUrl !== nextUrl) revokeObjectUrl(prevUrl);
+  };
+
+  // clientFileId resolution is async: start undefined (pending)
+  const [resolvedClientFileId, setResolvedClientFileId] = useState(undefined);
 
   useEffect(() => {
     let cancelled = false;
 
     (async () => {
+      setResolvedClientFileId(undefined);
+
       const direct = pickClientFileId(media, item);
       if (direct) {
         if (!cancelled) setResolvedClientFileId(String(direct));
@@ -87,114 +159,126 @@ export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, 
     };
   }, [scope, threadId, chatItemId, media, item]);
 
-  async function cleanupObjectUrl() {
-    if (objectUrlRef.current) {
-      try {
-        URL.revokeObjectURL(objectUrlRef.current);
-      } catch {}
-      objectUrlRef.current = null;
-    }
-  }
+  // Unmount cleanup only
+  useEffect(() => {
+    return () => {
+      if (objectUrlRef.current) {
+        revokeObjectUrl(objectUrlRef.current);
+        objectUrlRef.current = null;
+      }
+    };
+  }, []);
 
-  // Main resolver: local -> remote existing -> request via WS
+  // ✅ IMPORTANT:
+  // Only reset loadedMime when the identity of this media changes.
+  // Otherwise you'll create an effect loop that flips audio/video.
+  const identityRef = useRef("");
+
+  // Main resolver: local(original first) -> remote url -> WS request
   useEffect(() => {
     if (!isBrowser()) return;
 
     let cancelled = false;
 
     (async () => {
-      setError(null);
-      setLoadedMime("");
-
-      await cleanupObjectUrl();
-
-      // 1) Try localforage (if we have a clientFileId)
       const clientFileId = resolvedClientFileId;
+
+      // media identity (what this player is meant to play)
+      const identity = `${String(threadId || "")}:${String(chatItemId || "")}:${String(clientFileId || "")}`;
+
+      if (identityRef.current !== identity) {
+        identityRef.current = identity;
+        // reset only on identity change
+        setError(null);
+        setLoadedMime("");
+      } else {
+        // no reset: keep loadedMime stable to prevent audio/video flicker
+        setError(null);
+      }
+
+      // Build scopes to try (covers "uploaded as guest then logged in" too)
+      const scopesToTry = [];
+      if (scope) scopesToTry.push(scope);
+      scopesToTry.push("guest");
+      if (user?.$id) scopesToTry.push(String(user.$id));
+      const uniqScopes = Array.from(new Set(scopesToTry.filter(Boolean)));
+
+      // 1) Wait for clientFileId resolution (prevents remote-first flicker)
+      if (clientFileId === undefined) {
+        setStage("resolving_id");
+        return;
+      }
+
+      // 2) Localforage first (original wins)
       if (threadId && clientFileId) {
-        const scopesToTry = [];
-        if (scope) scopesToTry.push(scope);
-        scopesToTry.push("guest");
-        if (user?.$id) scopesToTry.push(String(user.$id));
+        const hit = await findLocalAcrossScopes({ scopes: uniqScopes, threadId, clientFileId });
+        if (cancelled) return;
 
-        const uniq = Array.from(new Set(scopesToTry.filter(Boolean)));
+        if (hit?.blob) {
+          const fallbackMime = String(hit?.meta?.mime || mimeHint || "");
 
-        for (const sc of uniq) {
-          try {
-            const blobOrFile = await getLocalMedia(sc, threadId, clientFileId);
-            if (cancelled) return;
+          if (sourceKind !== "local") {
+            setObjectSrcFromBlob(hit.blob, { mimeFallback: fallbackMime });
+          } else {
+            // If blob.type was empty previously, fill loadedMime once
+            if (!loadedMime && fallbackMime) setLoadedMime(fallbackMime);
+          }
 
-            if (blobOrFile instanceof Blob) {
-              const url = URL.createObjectURL(blobOrFile);
-              objectUrlRef.current = url;
-              setSrc(url);
-              setSourceKind("local");
-              setLoadedMime(String(blobOrFile.type || ""));
-              setStage("idle");
-              return;
-            }
-          } catch {}
+          setStage("idle");
+          return;
         }
       }
 
-      // 2) Remote URL already present (maybe pushed by server)
+      // 3) If server already gave a playable URL, use it
       const remote = pickPlayableUrl(media);
       if (remote) {
-        setSrc(String(remote));
-        setSourceKind("remote");
+        if (sourceKind !== "remote" || src !== String(remote)) {
+          setSrc(String(remote));
+          setSourceKind("remote");
+          // optional: set mime if we have a hint (doesn't change renderKind unless you rely on it)
+          if (!loadedMime && mimeHint) setLoadedMime(mimeHint);
+        }
         setStage("idle");
         return;
       }
 
-      // 3) Need to ask WS for media URL — but only when WS is ready
-      // Reset "requested" when inputs change
-      requestedRemoteRef.current = false;
-
+      // 4) Ask WS for media URL
       if (threadId && chatItemId && typeof requestMediaUrl === "function") {
         if (String(wsStatus || "") !== "ready") {
           setStage("waiting_ws");
-        } else {
-          setStage("requesting_url");
-          const ok = requestMediaUrl({ threadId, chatItemId });
-          if (ok) {
-            requestedRemoteRef.current = true;
-          } else {
-            // WS send failed: do NOT mark as requested; we’ll retry when wsStatus changes
-            requestedRemoteRef.current = false;
-            setStage("waiting_ws");
-          }
+          return;
         }
-      } else {
-        setStage("idle");
+
+        setStage("requesting_url");
+        const ok = requestMediaUrl({ threadId, chatItemId });
+        if (!ok) setStage("waiting_ws");
+        return;
       }
 
-      setSrc("");
-      setSourceKind("none");
+      setStage("idle");
     })();
 
     return () => {
       cancelled = true;
-      cleanupObjectUrl();
     };
-  }, [scope, user, threadId, chatItemId, media, resolvedClientFileId, requestMediaUrl, wsStatus]);
+  }, [
+    scope,
+    user,
+    threadId,
+    chatItemId,
+    media,
+    resolvedClientFileId,
+    requestMediaUrl,
+    wsStatus,
+    src,
+    sourceKind,
+    mimeHint,
+    loadedMime,
+  ]);
 
-  // Retry requesting URL when WS becomes ready (fixes the “asked too early” bug)
-  useEffect(() => {
-    const remote = pickPlayableUrl(media);
-    if (remote) return; // already have it
-    if (src) return;
-    if (!threadId || !chatItemId) return;
-    if (typeof requestMediaUrl !== "function") return;
+  // When remote URL arrives: cache server mp3 under serverVariantId (never overwrite original)
+  const cacheAttemptedRef = useRef(new Set());
 
-    if (String(wsStatus || "") !== "ready") return;
-    if (requestedRemoteRef.current) return;
-
-    setStage("requesting_url");
-    const ok = requestMediaUrl({ threadId, chatItemId });
-    if (ok) requestedRemoteRef.current = true;
-    else setStage("waiting_ws");
-  }, [wsStatus, threadId, chatItemId, requestMediaUrl, media, src]);
-
-  // When remote URL arrives later, optionally download+cache to localforage.
   useEffect(() => {
     let cancelled = false;
 
@@ -203,45 +287,65 @@ export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, 
       const clientFileId = resolvedClientFileId;
 
       if (!remote) return;
+      if (!threadId) return;
 
-      // ensure UI uses remote immediately
-      if (sourceKind !== "local") {
+      // show remote immediately only if we have nothing else
+      if (!src && sourceKind !== "local") {
         setSrc(String(remote));
         setSourceKind("remote");
+        if (!loadedMime && mimeHint) setLoadedMime(mimeHint);
       }
 
-      // only cache if we have a clientFileId (local indexing available)
-      if (!clientFileId || !threadId) return;
+      // need id to cache
+      if (!clientFileId) return;
 
-      // if already local, don’t download
+      const serverId = serverVariantId(clientFileId);
+      if (!serverId) return;
+
+      // if already local (original or cached), don’t cache/download
       if (sourceKind === "local") return;
 
-      // only cache if we have a scope
+      const scopesToTry = [];
+      if (scope) scopesToTry.push(scope);
+      scopesToTry.push("guest");
+      if (user?.$id) scopesToTry.push(String(user.$id));
+      const uniqScopes = Array.from(new Set(scopesToTry.filter(Boolean)));
+
+      // If original exists (or server variant exists), stop
+      const existing = await findLocalAcrossScopes({ scopes: uniqScopes, threadId, clientFileId });
+      if (existing?.blob) return;
+
+      // Fetch only once per thread+serverId per session
+      const cacheKey = `${String(threadId)}:${String(serverId)}`;
+      if (cacheAttemptedRef.current.has(cacheKey)) return;
+      cacheAttemptedRef.current.add(cacheKey);
+
       const sc = scope || "guest";
 
-      try {
-        const existing = await getLocalMedia(sc, threadId, clientFileId);
-        if (existing instanceof Blob) return;
-      } catch {}
-
-      // download + cache
       setStage("downloading");
       try {
         const blob = await fetchBlob(remote);
         if (cancelled) return;
 
-        await putLocalMedia(sc, threadId, clientFileId, blob);
+        await putLocalMedia(sc, threadId, serverId, blob);
+        await putLocalMediaMeta(sc, threadId, serverId, {
+          origin: "server",
+          variant: "server",
+          originalClientFileId: String(clientFileId),
+          sourceUrl: String(remote),
+          mime: String(blob?.type || "audio/mpeg"),
+          bytes: Number(blob?.size || 0) || 0,
+          savedAt: new Date().toISOString(),
+        });
+
         if (cancelled) return;
 
-        await cleanupObjectUrl();
-        const url = URL.createObjectURL(blob);
-        objectUrlRef.current = url;
-
-        setSrc(url);
-        setSourceKind("local");
-        setLoadedMime(String(blob.type || ""));
+        // Don’t swap src mid-play; only use local if nothing is playing/loaded yet
+        if (!src && sourceKind !== "local") {
+          setObjectSrcFromBlob(blob, { mimeFallback: String(blob?.type || "audio/mpeg") });
+        }
       } catch {
-        // CORS/Range/etc can break caching — but remote playback still works.
+        // caching may fail; remote playback still works
       } finally {
         if (!cancelled) setStage("idle");
       }
@@ -250,7 +354,7 @@ export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, 
     return () => {
       cancelled = true;
     };
-  }, [media, resolvedClientFileId, threadId, scope, sourceKind]);
+  }, [media, resolvedClientFileId, threadId, scope, user, src, sourceKind, loadedMime, mimeHint]);
 
   // Expose API (seek/play)
   useEffect(() => {
@@ -289,14 +393,15 @@ export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, 
     return () => {
       if (typeof onApi === "function") onApi(null);
     };
-  }, [onApi, src]);
+  }, [onApi]);
 
   const renderKind = useMemo(() => {
-    const m = loadedMime || mimeHint;
+    // Prefer loadedMime when local; otherwise fall back to server hint
+    const m = sourceKind === "local" ? (loadedMime || mimeHint) : (mimeHint || loadedMime);
     if (isVideoLike(m)) return "video";
     if (isAudioLike(m)) return "audio";
     return "audio";
-  }, [loadedMime, mimeHint]);
+  }, [loadedMime, mimeHint, sourceKind]);
 
   const onTimeUpdate = () => {
     const el = elRef.current;
@@ -312,6 +417,8 @@ export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, 
       ? stage === "downloading"
         ? "Downloading…"
         : "Remote"
+      : stage === "resolving_id"
+      ? "Resolving…"
       : stage === "waiting_ws"
       ? "Waiting…"
       : stage === "requesting_url"
@@ -319,7 +426,9 @@ export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, 
       : "No media";
 
   const emptyText =
-    stage === "waiting_ws"
+    stage === "resolving_id"
+      ? "Resolving local media…"
+      : stage === "waiting_ws"
       ? "Waiting for server connection…"
       : stage === "requesting_url"
       ? "Requesting media URL…"
@@ -330,7 +439,7 @@ export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, 
       <TopRow>
         <Badges>
           <Badge $kind={sourceKind}>{badgeText}</Badge>
-          {(loadedMime || mimeHint) ? <Meta>{loadedMime || mimeHint}</Meta> : null}
+          {loadedMime || mimeHint ? <Meta>{loadedMime || mimeHint}</Meta> : null}
         </Badges>
       </TopRow>
 
@@ -366,7 +475,7 @@ export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, 
 
 const Wrap = styled.div`
   border: 1px solid var(--border);
-  background: rgba(0,0,0,0.02);
+  background: rgba(0, 0, 0, 0.02);
   border-radius: 14px;
   padding: 10px;
   display: flex;

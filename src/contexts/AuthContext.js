@@ -1,167 +1,217 @@
 // contexts/AuthContext.js
-import React, { createContext, useContext, useEffect, useRef, useState } from "react";
-import { account } from "../lib/appwrite";
+import React, { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { Client, Account } from "appwrite";
 
 const AuthContext = createContext(null);
 
-function toInt(v) {
-  const n = Number.parseInt(String(v ?? ""), 10);
-  return Number.isFinite(n) ? n : null;
+function hasOwn(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj || {}, key);
 }
 
-function parseErrorFromUrl() {
-  if (typeof window === "undefined") return null;
-  const params = new URLSearchParams(window.location.search);
-  const raw = params.get("error");
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw);
-  } catch {
-    try {
-      return JSON.parse(decodeURIComponent(raw));
-    } catch {
-      return null;
-    }
+function makeAppwrite() {
+  const endpoint = process.env.NEXT_PUBLIC_APPWRITE_ENDPOINT;
+  const project = process.env.NEXT_PUBLIC_APPWRITE_PROJECT_ID;
+
+  if (!endpoint || !project) {
+    // Don't hard-crash SSR; just throw in client runtime usage
+    throw new Error("Missing Appwrite env (NEXT_PUBLIC_APPWRITE_ENDPOINT/PROJECT_ID)");
   }
+
+  const client = new Client();
+  client.setEndpoint(endpoint);
+  client.setProject(project);
+
+  const account = new Account(client);
+  return { client, account };
 }
 
-function clearErrorFromUrl() {
-  if (typeof window === "undefined") return;
-  const url = new URL(window.location.href);
-  url.searchParams.delete("error");
-  // also drop any hash garbage
-  url.hash = "";
-  window.history.replaceState({}, "", url.pathname + (url.search ? url.search : ""));
+async function fetchTokensWithJwt(jwt) {
+  if (!jwt) return null;
+
+  const res = await fetch("/api/auth/tokens", {
+    method: "GET",
+    headers: { authorization: `Bearer ${jwt}` },
+    credentials: "include",
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data?.message || "Failed to refresh tokens");
+    err.statusCode = res.status;
+    throw err;
+  }
+  return data;
 }
 
 export function AuthProvider({ children }) {
+  const appwriteRef = useRef(null);
+  const jwtCacheRef = useRef({ jwt: null, at: 0 });
+
   const [user, setUser] = useState(null);
-  const [session, setSession] = useState(null);
-  const [loading, setLoading] = useState(true);
+  const [loadingAuth, setLoadingAuth] = useState(true);
+  const [isAnonymous, setIsAnonymous] = useState(true);
 
-  const bootedRef = useRef(false);
+  // Optional, but handy if you show tokens in UI
+  const [tokens, setTokens] = useState({
+    mediaTokens: 0,
+    mediaTokensBalance: 0,
+    mediaTokensReserved: 0,
+    provider: null,
+    pricingVersion: null,
+    serverTime: null,
+  });
 
-  const getProvider = (s) => {
-    const p = s?.provider;
-    return typeof p === "string" ? p.toLowerCase() : "";
+
+  // ✅ allow WS (and other sources) to update token state safely with partial payloads
+ const applyTokensSnapshot = (snap) => {
+    if (!snap || typeof snap !== "object") return;
+
+    setTokens((prev) => {
+      const next = { ...(prev || {}) };
+
+      if (hasOwn(snap, "mediaTokens")) next.mediaTokens = Number(snap.mediaTokens || 0) || 0;
+      if (hasOwn(snap, "mediaTokensBalance")) next.mediaTokensBalance = Number(snap.mediaTokensBalance || 0) || 0;
+      if (hasOwn(snap, "mediaTokensReserved")) next.mediaTokensReserved = Number(snap.mediaTokensReserved || 0) || 0;
+      if (hasOwn(snap, "provider")) next.provider = snap.provider || null;
+      if (hasOwn(snap, "pricingVersion")) next.pricingVersion = snap.pricingVersion || null;
+      if (hasOwn(snap, "serverTime")) next.serverTime = snap.serverTime || null;
+
+      return next;
+    });
   };
 
-  const refresh = async () => {
-    const u = await account.get();
-    setUser(u);
+  const getAccount = () => {
+    if (!appwriteRef.current) appwriteRef.current = makeAppwrite();
+    return appwriteRef.current.account;
+  };
+
+  const refreshUser = async () => {
+    const account = getAccount();
+    try {
+      const u = await account.get();
+      setUser(u || null);
+      setIsAnonymous(!u?.$id);
+      return u || null;
+    } catch {
+      setUser(null);
+      setIsAnonymous(true);
+      return null;
+    }
+  };
+
+  const getJwt = async ({ force } = {}) => {
+    if (typeof window === "undefined") return null;
+    const account = getAccount();
+
+    // Cache a JWT briefly to avoid spamming createJWT on every request.
+    const now = Date.now();
+    const cached = jwtCacheRef.current || {};
+    if (!force && cached.jwt && now - (cached.at || 0) < 3 * 60 * 1000) {
+      return cached.jwt;
+    }
 
     try {
-      const s = await account.getSession("current");
-      setSession(s);
-      return { u, s };
+      const r = await account.createJWT();
+      const jwt = r?.jwt ? String(r.jwt) : null;
+      jwtCacheRef.current = { jwt: jwt || null, at: now };
+      return jwt || null;
     } catch {
-      setSession(null);
-      return { u, s: null };
+      jwtCacheRef.current = { jwt: null, at: now };
+      return null;
     }
   };
 
-  const ensureMediaTokenDefaults = async ({ u, s }) => {
-    const provider = getProvider(s);
-    const defaultTokens = provider === "google" ? 50 : 5;
+  // ✅ This is the actual "3)" logic: call /api/auth/tokens after login/restore
+  const refreshTokens = async ({ forceJwt } = {}) => {
+    if (isAnonymous) return null;
 
-    const current = toInt(u?.prefs?.mediaTokens);
-    let desired = current;
+    const jwt = await getJwt({ force: !!forceJwt });
+    if (!jwt) return null;
 
-    if (desired == null) desired = defaultTokens;
-    if (provider === "google" && desired < 50) desired = 50;
-    if (current != null && desired < current) desired = current;
-
-    if (current !== desired) {
-      const mergedPrefs = { ...(u?.prefs || {}), mediaTokens: desired };
-      await account.updatePrefs(mergedPrefs);
-      setUser((prev) => (prev ? { ...prev, prefs: { ...(prev.prefs || {}), mediaTokens: desired } } : prev));
+    const data = await fetchTokensWithJwt(jwt);
+    if (data && typeof data === "object") {
+      applyTokensSnapshot({
+        mediaTokens: data.mediaTokens,
+        mediaTokensBalance: data.mediaTokensBalance,
+        mediaTokensReserved: data.mediaTokensReserved,
+        provider: data.provider || null,
+        pricingVersion: data.pricingVersion || null,
+        serverTime: data.serverTime || null,
+      });
     }
+    return data;
   };
 
-  const ensureSession = async () => {
-    try {
-      const data = await refresh();
-      await ensureMediaTokenDefaults(data);
-      return;
-    } catch {
-      await account.createAnonymousSession();
-      const data = await refresh();
-      await ensureMediaTokenDefaults(data);
-    }
-  };
-
+  // Boot: restore session (auto-login) then refresh tokens once
   useEffect(() => {
-    if (bootedRef.current) return;
-    bootedRef.current = true;
-
+    let alive = true;
     (async () => {
+      setLoadingAuth(true);
       try {
-        setLoading(true);
+        const u = await refreshUser();
+        if (!alive) return;
 
-        // If Appwrite sent us back with an OAuth error, clear it so it doesn't stick.
-        const err = parseErrorFromUrl();
-        if (err) {
-          clearErrorFromUrl();
+        if (u?.$id) {
+          // will auto-grant to 50 for google after your server-side fix
+          await refreshTokens({ forceJwt: true });
         }
-
-        await ensureSession();
       } finally {
-        setLoading(false);
+        if (alive) setLoadingAuth(false);
       }
     })();
+
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const loginWithGoogle = async () => {
-    const origin = window.location.origin;
+  // If user changes from logged out -> logged in in-app, refresh tokens again
+  useEffect(() => {
+    if (!user?.$id) return;
+    if (isAnonymous) return;
 
-    // IMPORTANT:
-    // If we're currently anonymous, delete that session first so OAuth signs in normally
-    // instead of trying to link Google onto the guest account (which causes user_already_exists).
-    try {
-      const s = await account.getSession("current");
-      if (getProvider(s) === "anonymous") {
-        await account.deleteSession("current");
-      }
-    } catch {
-      // ignore
-    }
+    refreshTokens({ forceJwt: true }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.$id, isAnonymous]);
 
-    account.createOAuth2Session("google", origin, origin);
-  };
-
-  const getJwt = async () => {
-    const r = await account.createJWT();
-    return r?.jwt;
-  };
-
-
+  // Optional helpers (useful for UI buttons)
   const logout = async () => {
-    await account.deleteSession("current");
-    setUser(null);
-    setSession(null);
-
-    setLoading(true);
     try {
-      await ensureSession();
-    } finally {
-      setLoading(false);
-    }
+      const account = getAccount();
+      await account.deleteSessions();
+    } catch {}
+    jwtCacheRef.current = { jwt: null, at: 0 };
+    setUser(null);
+    setIsAnonymous(true);
+    setTokens({
+      mediaTokens: 0,
+      mediaTokensBalance: 0,
+      mediaTokensReserved: 0,
+      provider: null,
+      pricingVersion: null,
+      serverTime: null,
+    });
   };
 
-  const isAnonymous = getProvider(session) === "anonymous";
-  const mediaTokens = toInt(user?.prefs?.mediaTokens) ?? 0;
+  const value = useMemo(() => {
+    return {
+      user,
+      loadingAuth,
+      isAnonymous,
 
-  const value = {
-    user,
-    session,
-    isAnonymous,
-    mediaTokens,
-    loading,
-    refresh,
-    loginWithGoogle,
-    logout,
-    getJwt
-  };
+      getJwt,
+      refreshUser,
+      refreshTokens,
+      applyTokensSnapshot,
+
+      // optional token state (if you want to show it in UI)
+      tokens,
+      mediaTokens: tokens.mediaTokens,
+
+      logout,
+    };
+  }, [user, loadingAuth, isAnonymous, tokens]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

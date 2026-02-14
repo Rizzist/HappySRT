@@ -8,6 +8,7 @@ import { apiCreateThread, apiRenameThread, apiDeleteThread } from "../lib/api/th
 import { putLocalMedia, deleteLocalMedia } from "../lib/mediaStore";
 import { createThreadWsClient } from "../lib/wsThreadsClient";
 import { putMediaIndex, getMediaIndex } from "../lib/mediaIndexStore";
+import { putLocalMediaMeta } from "../lib/mediaMetaStore";
 
 const ThreadsContext = createContext(null);
 
@@ -53,7 +54,6 @@ async function hydrateChatItemsWithMediaIndex(scope, threadId, chatItems) {
 
   return out;
 }
-
 
 function nowIso() {
   return new Date().toISOString();
@@ -153,8 +153,6 @@ function applyChatItemPatch(item, patch) {
   };
 }
 
-
-
 // ---------- file helpers ----------
 function isAudioOrVideoFile(file) {
   const t = String(file?.type || "");
@@ -165,6 +163,82 @@ function isMp3(file) {
   const t = String(file?.type || "");
   const n = String(file?.name || "");
   return t === "audio/mpeg" || /\.mp3$/i.test(n);
+}
+
+function safeFinite(n) {
+  const x = Number(n);
+  return Number.isFinite(x) ? x : null;
+}
+
+function probeDurationSecondsFromSrc({ src, kind }) {
+  if (typeof window === "undefined") return Promise.resolve(null);
+
+  const tag = kind === "video" ? "video" : "audio";
+  const el = document.createElement(tag);
+
+  el.preload = "metadata";
+  el.muted = true;
+  el.playsInline = true;
+
+  return new Promise((resolve) => {
+    let done = false;
+
+    const cleanup = () => {
+      el.removeAttribute("src");
+      try {
+        el.load();
+      } catch {}
+      el.onloadedmetadata = null;
+      el.onerror = null;
+    };
+
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      resolve(v);
+    };
+
+    const timer = setTimeout(() => finish(null), 6000);
+
+    el.onloadedmetadata = () => {
+      clearTimeout(timer);
+      const d = safeFinite(el.duration);
+      if (!d || !Number.isFinite(d) || d <= 0 || d === Infinity) return finish(null);
+      finish(Number(d.toFixed(3)));
+    };
+
+    el.onerror = () => {
+      clearTimeout(timer);
+      finish(null);
+    };
+
+    try {
+      el.src = String(src || "");
+    } catch {
+      clearTimeout(timer);
+      finish(null);
+    }
+  });
+}
+
+async function probeDurationSecondsFromFile(file) {
+  if (!file || typeof window === "undefined") return null;
+  const url = URL.createObjectURL(file);
+  try {
+    const isVideo = String(file.type || "").startsWith("video/");
+    return await probeDurationSecondsFromSrc({ src: url, kind: isVideo ? "video" : "audio" });
+  } finally {
+    try {
+      URL.revokeObjectURL(url);
+    } catch {}
+  }
+}
+
+async function probeDurationSecondsFromUrl(url) {
+  const clean = String(url || "").trim();
+  if (!clean) return null;
+  return probeDurationSecondsFromSrc({ src: clean, kind: "audio" });
 }
 
 function baseName(name) {
@@ -183,8 +257,7 @@ async function convertToMp3OrPassThrough(file, { ensureFfmpeg, extractAudioToMp3
   if (!(mp3File instanceof File)) throw new Error("FFmpeg conversion did not return an mp3 File");
 
   const wantedName = `${baseName(file?.name)}.mp3`;
-  const renamed =
-    mp3File.name === "output.mp3" ? new File([mp3File], wantedName, { type: "audio/mpeg" }) : mp3File;
+  const renamed = mp3File.name === "output.mp3" ? new File([mp3File], wantedName, { type: "audio/mpeg" }) : mp3File;
 
   if (!String(renamed.type).startsWith("audio/")) {
     return new File([renamed], renamed.name || wantedName, { type: "audio/mpeg" });
@@ -245,8 +318,8 @@ async function apiGetThread(jwt, { threadId }) {
 }
 
 export function ThreadsProvider({ children }) {
-  const { user, isAnonymous, getJwt } = useAuth();
-  const { extractAudioToMp3, ensureFfmpeg } = useFfmpeg();
+  const { user, isAnonymous, getJwt, refreshTokens, applyTokensSnapshot } = useAuth();
+   const { extractAudioToMp3, ensureFfmpeg } = useFfmpeg();
 
   const [threadsById, setThreadsById] = useState({});
   const [activeId, setActiveIdState] = useState("default");
@@ -275,13 +348,11 @@ export function ThreadsProvider({ children }) {
   }, [activeId]);
 
   const scope = useMemo(() => {
-    if (!user) return null;
-    return isAnonymous ? "guest" : user.$id;
-  }, [user, isAnonymous]);
+    if (isAnonymous) return "guest";
+    return user?.$id ? String(user.$id) : null;
+  }, [user?.$id, isAnonymous]);
 
   const bootedRef = useRef(false);
-
-  
 
   const persist = async (nextThreadsById, nextActiveId, nextSync) => {
     if (!scope) return;
@@ -320,6 +391,30 @@ export function ThreadsProvider({ children }) {
     toast.error(message ? `${code}: ${message}` : String(code || "WS error"));
   };
 
+  // =========================
+  // ✅ Token refresh throttling
+  // =========================
+  const tokenRefreshRef = useRef({ at: 0, inFlight: false });
+
+  const refreshTokensThrottled = async () => {
+    // only makes sense for authed users
+    if (isAnonymous) return;
+    if (typeof refreshTokens !== "function") return;
+
+    const now = Date.now();
+    const lastAt = Number(tokenRefreshRef.current?.at || 0) || 0;
+
+    // throttle to avoid spamming /api/auth/tokens
+    if (tokenRefreshRef.current?.inFlight) return;
+    if (now - lastAt < 3500) return;
+
+    tokenRefreshRef.current = { ...tokenRefreshRef.current, inFlight: true };
+    try {
+      await refreshTokens();
+    } catch {}
+    tokenRefreshRef.current = { at: Date.now(), inFlight: false };
+  };
+
   const clearLiveThread = (threadId) => {
     setLiveRunsByThread((prev) => {
       const next = { ...(prev || {}) };
@@ -356,12 +451,13 @@ export function ThreadsProvider({ children }) {
     const existing = cur[t.id] || null;
 
     const mergedDraft = mergeDraft(t.draft, existing?.draft);
-let nextChatItems = mergeChatItems(existing?.chatItems, chatItems || t.chatItems);
-if (scope) {
-  try {
-    nextChatItems = await hydrateChatItemsWithMediaIndex(scope, t.id, nextChatItems);
-  } catch {}
-}
+    let nextChatItems = mergeChatItems(existing?.chatItems, chatItems || t.chatItems);
+
+    if (scope) {
+      try {
+        nextChatItems = await hydrateChatItemsWithMediaIndex(scope, t.id, nextChatItems);
+      } catch {}
+    }
 
     const nextThread = {
       ...(existing || {}),
@@ -420,11 +516,27 @@ if (scope) {
     if (type === "HELLO_OK") {
       setWsError(null);
       setWsStatus("ready");
+
+      // ✅ Server already sends the live token snapshot in HELLO_OK
+      // payload: { mediaTokens, mediaTokensBalance, mediaTokensReserved, pricingVersion, serverTime, ... }
+      try {
+        const p = msg?.payload || {};
+        if (typeof applyTokensSnapshot === "function") {
+          applyTokensSnapshot({
+            mediaTokens: p.mediaTokens,
+            mediaTokensBalance: p.mediaTokensBalance,
+            mediaTokensReserved: p.mediaTokensReserved,
+            pricingVersion: p.pricingVersion || null,
+            serverTime: p.serverTime || p.ts || null,
+          });
+        }
+      } catch {}
+
+      // also do a throttled API refresh to stay authoritative
+      refreshTokensThrottled().catch(() => {});
       return;
     }
-    
 
-    // ✅ FIX: don't silently swallow WS errors
     if (type === "ERROR") {
       const code = msg?.payload?.code || "WS_ERROR";
       const message = msg?.payload?.message || "WebSocket error";
@@ -434,36 +546,35 @@ if (scope) {
     }
 
     if (type === "MEDIA_URL") {
-  const chatItemId = String(msg?.payload?.chatItemId || "");
-  const url = String(msg?.payload?.url || "");
-  if (!chatItemId || !url) return;
+      const chatItemId = String(msg?.payload?.chatItemId || "");
+      const url = String(msg?.payload?.url || "");
+      if (!chatItemId || !url) return;
 
-  const cur = threadsRef.current || {};
-  const t = cur[threadId];
-  if (!t) return;
+      const cur = threadsRef.current || {};
+      const t = cur[threadId];
+      if (!t) return;
 
-  const items = ensureChatItemsArray(t.chatItems);
-  const idx = items.findIndex((x) => String(x?.chatItemId || "") === chatItemId);
-  if (idx < 0) return;
+      const items = ensureChatItemsArray(t.chatItems);
+      const idx = items.findIndex((x) => String(x?.chatItemId || "") === chatItemId);
+      if (idx < 0) return;
 
-  const it = items[idx] || {};
-  const media = it.media && typeof it.media === "object" ? it.media : {};
+      const it = items[idx] || {};
+      const media = it.media && typeof it.media === "object" ? it.media : {};
 
-  const nextItems = [...items];
-  nextItems[idx] = {
-    ...it,
-    media: { ...media, playbackUrl: url },
-    updatedAt: nowIso(),
-  };
+      const nextItems = [...items];
+      nextItems[idx] = {
+        ...it,
+        media: { ...media, playbackUrl: url },
+        updatedAt: nowIso(),
+      };
 
-  const nextThread = { ...t, chatItems: nextItems, updatedAt: nowIso() };
-  const nextThreads = { ...cur, [threadId]: nextThread };
-  setThreadsById(nextThreads);
-  threadsRef.current = nextThreads;
+      const nextThread = { ...t, chatItems: nextItems, updatedAt: nowIso() };
+      const nextThreads = { ...cur, [threadId]: nextThread };
+      setThreadsById(nextThreads);
+      threadsRef.current = nextThreads;
 
-  return;
-}
-
+      return;
+    }
 
     if (type === "THREAD_SNAPSHOT") {
       const thread = msg?.payload?.thread || null;
@@ -472,7 +583,6 @@ if (scope) {
       return;
     }
 
-    // ✅ FIX: reconcile using the *message* threadId, not a potentially stale ref
     if (type === "THREAD_INVALIDATED") {
       try {
         const bound = wsBoundThreadRef.current;
@@ -488,6 +598,9 @@ if (scope) {
     if (type === "RUN_CREATED") {
       const runId = String(msg?.payload?.runId || "");
       patchLiveThread(threadId, { lastRunId: runId || null });
+
+      // ✅ token reservations / charges often happen around run start
+      refreshTokensThrottled().catch(() => {});
       return;
     }
 
@@ -500,55 +613,50 @@ if (scope) {
       const cur = threadsRef.current || {};
       const t = cur[threadId];
 
-      // Build map from draft itemId -> clientFileId (and local meta)
-const draftMap = {};
-try {
-  const cur = threadsRef.current || {};
-  const tLocal = cur[threadId];
-  const d = tLocal?.draft && typeof tLocal.draft === "object" ? tLocal.draft : null;
-  const files = Array.isArray(d?.files) ? d.files : [];
-  for (const f of files) {
-    const iid = String(f?.itemId || "");
-    if (!iid) continue;
-    draftMap[iid] = {
-      clientFileId: f?.clientFileId || null,
-      local: f?.local || null,
-    };
-  }
-} catch {}
+      const draftMap = {};
+      try {
+        const cur2 = threadsRef.current || {};
+        const tLocal = cur2[threadId];
+        const d = tLocal?.draft && typeof tLocal.draft === "object" ? tLocal.draft : null;
+        const files = Array.isArray(d?.files) ? d.files : [];
+        for (const f of files) {
+          const iid = String(f?.itemId || "");
+          if (!iid) continue;
+          draftMap[iid] = {
+            clientFileId: f?.clientFileId || null,
+            local: f?.local || null,
+          };
+        }
+      } catch {}
 
-// Patch incoming chat items with clientFileId so player can find localforage
-const patchedItems = items.map((it) => {
-  const iid = String(it?.itemId || "");
-  const m = it?.media && typeof it.media === "object" ? it.media : {};
-  if (m.clientFileId) return it;
+      const patchedItems = items.map((it) => {
+        const iid = String(it?.itemId || "");
+        const m = it?.media && typeof it.media === "object" ? it.media : {};
+        if (m.clientFileId) return it;
 
-  const hit = draftMap[iid];
-  if (!hit?.clientFileId) return it;
+        const hit = draftMap[iid];
+        if (!hit?.clientFileId) return it;
 
-  return {
-    ...it,
-    media: {
-      ...m,
-      clientFileId: String(hit.clientFileId),
-    },
-  };
-});
-
+        return {
+          ...it,
+          media: {
+            ...m,
+            clientFileId: String(hit.clientFileId),
+          },
+        };
+      });
 
       if (t) {
         const d = ensureDraftShape(t.draft);
 
-        const nextDraftFiles =
-          movedItemIds.length
-            ? (d.files || []).filter((f) => !movedItemIds.includes(String(f?.itemId || "")))
-            : d.files || [];
+        const nextDraftFiles = movedItemIds.length
+          ? (d.files || []).filter((f) => !movedItemIds.includes(String(f?.itemId || "")))
+          : d.files || [];
 
         const next = {
           ...t,
           draft: { ...d, files: nextDraftFiles },
           chatItems: mergeChatItems(t.chatItems, patchedItems),
-
         };
 
         const nextThreads = { ...cur, [threadId]: next };
@@ -563,26 +671,25 @@ const patchedItems = items.map((it) => {
       }
 
       if (runId) patchLiveThread(threadId, { lastRunId: runId });
+      // ✅ often tokens are reserved/charged when items are created
+      refreshTokensThrottled().catch(() => {});
 
-      // Persist mapping chatItemId -> clientFileId for future snapshots / refreshes
-if (scope) {
-  try {
-    for (const it of patchedItems) {
-      const cid = String(it?.chatItemId || "");
-      const cfi = it?.media?.clientFileId ? String(it.media.clientFileId) : "";
-      if (!cid || !cfi) continue;
+      if (scope) {
+        try {
+          for (const it of patchedItems) {
+            const cid = String(it?.chatItemId || "");
+            const cfi = it?.media?.clientFileId ? String(it.media.clientFileId) : "";
+            if (!cid || !cfi) continue;
 
-      await putMediaIndex(scope, threadId, cid, {
-        clientFileId: cfi,
-        filename: it?.media?.filename || it?.media?.name || null,
-        mime: it?.media?.mime || null,
-      });
-    }
-  } catch {}
-}
+            await putMediaIndex(scope, threadId, cid, {
+              clientFileId: cfi,
+              filename: it?.media?.filename || it?.media?.name || null,
+              mime: it?.media?.mime || null,
+            });
+          }
+        } catch {}
+      }
 
-
-      // ✅ Safety: ask for a snapshot to guarantee draft is cleared everywhere
       try {
         const bound = wsBoundThreadRef.current;
         if (bound && String(bound) === String(threadId) && wsClientRef.current?.isConnected()) {
@@ -594,43 +701,42 @@ if (scope) {
     }
 
     if (type === "CHAT_ITEM_SEGMENTS") {
-  const chatItemId = String(msg?.payload?.chatItemId || "");
-  const step = String(msg?.payload?.step || "transcribe");
-  const incoming = Array.isArray(msg?.payload?.segments) ? msg.payload.segments : [];
-  const append = !!msg?.payload?.append;
+      const chatItemId = String(msg?.payload?.chatItemId || "");
+      const step = String(msg?.payload?.step || "transcribe");
+      const incoming = Array.isArray(msg?.payload?.segments) ? msg.payload.segments : [];
+      const append = !!msg?.payload?.append;
 
-  if (!chatItemId) return;
+      if (!chatItemId) return;
 
-  setLiveRunsByThread((prev) => {
-    const cur = (prev && prev[threadId]) || {};
-    const chatItems = cur.chatItems && typeof cur.chatItems === "object" ? cur.chatItems : {};
-    const existing = chatItems[chatItemId] || {};
+      setLiveRunsByThread((prev) => {
+        const cur = (prev && prev[threadId]) || {};
+        const chatItems = cur.chatItems && typeof cur.chatItems === "object" ? cur.chatItems : {};
+        const existing = chatItems[chatItemId] || {};
 
-    const segObj = existing.segments && typeof existing.segments === "object" ? existing.segments : {};
-    const arr = Array.isArray(segObj[step]) ? segObj[step] : [];
+        const segObj = existing.segments && typeof existing.segments === "object" ? existing.segments : {};
+        const arr = Array.isArray(segObj[step]) ? segObj[step] : [];
 
-    const nextArr = append ? [...arr, ...incoming] : [...incoming];
+        const nextArr = append ? [...arr, ...incoming] : [...incoming];
 
-    return {
-      ...(prev || {}),
-      [threadId]: {
-        ...cur,
-        chatItems: {
-          ...chatItems,
-          [chatItemId]: {
-            ...existing,
-            segments: { ...segObj, [step]: nextArr },
+        return {
+          ...(prev || {}),
+          [threadId]: {
+            ...cur,
+            chatItems: {
+              ...chatItems,
+              [chatItemId]: {
+                ...existing,
+                segments: { ...segObj, [step]: nextArr },
+                updatedAt: nowIso(),
+              },
+            },
             updatedAt: nowIso(),
           },
-        },
-        updatedAt: nowIso(),
-      },
-    };
-  });
+        };
+      });
 
-  return;
-}
-
+      return;
+    }
 
     if (type === "CHAT_ITEM_PROGRESS") {
       const chatItemId = String(msg?.payload?.chatItemId || "");
@@ -709,6 +815,12 @@ if (scope) {
           updatedAt: nowIso(),
         };
 
+     // ✅ when transcribe finishes/fails, refresh tokens (deductions typically finalize here)
+      try {
+        const st = String(patch?.status?.transcribe?.state || "");
+        if (st === "done" || st === "failed") refreshTokensThrottled().catch(() => {});
+      } catch {}
+
       const cur = threadsRef.current || {};
       const t = cur[threadId];
       if (!t) return;
@@ -728,12 +840,19 @@ if (scope) {
       return;
     }
 
-    // ✅ Fix: show failures loudly (this is what "Start did nothing" really was)
+    // (Optional) handle completion if you ever emit it server-side
+    if (type === "RUN_COMPLETED") {
+      refreshTokensThrottled().catch(() => {});
+      return;
+    }
+
     if (type === "RUN_FAILED") {
       const message = String(msg?.payload?.message || "Run failed");
       toast.error(message);
 
-      // re-sync
+     // ✅ refresh in case reserved tokens were released or a charge was reverted
+      refreshTokensThrottled().catch(() => {});
+
       try {
         const bound = wsBoundThreadRef.current;
         if (bound && String(bound) === String(threadId) && wsClientRef.current?.isConnected()) {
@@ -780,8 +899,9 @@ if (scope) {
       onStatus: (s) => {
         const st = String(s?.status || "");
         setWsStatus(st || "disconnected");
-        if (st === "connected") setWsError(null);
-      },
+        // ws client emits "socket_open" and "ready"
+        if (st === "ready" || st === "socket_open" || st === "connecting") setWsError(null);
+       },
       onEvent: (msg) => {
         handleWsEvent(msg).catch(() => {});
       },
@@ -808,14 +928,13 @@ if (scope) {
   };
 
   const requestMediaUrl = ({ threadId, chatItemId } = {}) => {
-  const tid = String(threadId || wsBoundThreadRef.current || "");
-  const cid = String(chatItemId || "");
-  if (!tid || !cid) return false;
-  if (!wsClientRef.current || !wsClientRef.current.isConnected()) return false;
+    const tid = String(threadId || wsBoundThreadRef.current || "");
+    const cid = String(chatItemId || "");
+    if (!tid || !cid) return false;
+    if (!wsClientRef.current || !wsClientRef.current.isConnected()) return false;
 
-  return wsClientRef.current.send("GET_MEDIA_URL", { threadId: tid, chatItemId: cid });
-};
-
+    return wsClientRef.current.send("GET_MEDIA_URL", { threadId: tid, chatItemId: cid });
+  };
 
   const requestThreadSnapshot = () => {
     const tid = wsBoundThreadRef.current;
@@ -823,7 +942,7 @@ if (scope) {
     return wsClientRef.current.send("GET_THREAD_SNAPSHOT", { threadId: tid, includeChatItems: true });
   };
 
-    const clearTranscribeFieldsOnThread = (threadId, chatItemId) => {
+  const clearTranscribeFieldsOnThread = (threadId, chatItemId) => {
     const tid = String(threadId || "");
     const cid = String(chatItemId || "");
     if (!tid || !cid) return;
@@ -871,66 +990,60 @@ if (scope) {
     setThreadsById(nextThreads);
     threadsRef.current = nextThreads;
 
-    // persist immediately if this is the active thread
     if (String(activeRef.current) === tid) {
       persist(nextThreads, activeRef.current, syncRef.current).catch(() => {});
     }
   };
 
-
   const retryTranscribe = async ({ chatItemIds, chatItemId, options } = {}) => {
-  const tid = wsBoundThreadRef.current || activeRef.current;
-  if (!tid || tid === "default") {
-    toast.error("No thread selected.");
-    return false;
-  }
+    const tid = wsBoundThreadRef.current || activeRef.current;
+    if (!tid || tid === "default") {
+      toast.error("No thread selected.");
+      return false;
+    }
 
-  if (!wsClientRef.current || !wsClientRef.current.isConnected()) {
-    toast.error("Not connected to the realtime server yet.");
-    return false;
-  }
+    if (!wsClientRef.current || !wsClientRef.current.isConnected()) {
+      toast.error("Not connected to the realtime server yet.");
+      return false;
+    }
 
-  const ids =
-    Array.isArray(chatItemIds) && chatItemIds.length
-      ? chatItemIds.map((x) => String(x || "")).filter(Boolean)
-      : chatItemId
-      ? [String(chatItemId)]
-      : [];
+    const ids =
+      Array.isArray(chatItemIds) && chatItemIds.length
+        ? chatItemIds.map((x) => String(x || "")).filter(Boolean)
+        : chatItemId
+        ? [String(chatItemId)]
+        : [];
 
-  if (!ids.length) {
-    toast.error("No chatItemId(s) provided.");
-    return false;
-  }
+    if (!ids.length) {
+      toast.error("No chatItemId(s) provided.");
+      return false;
+    }
 
-  const payload = {
-    threadId: String(tid),
-    chatItemIds: ids,
-    options: options && typeof options === "object" ? options : {},
+    const payload = {
+      threadId: String(tid),
+      chatItemIds: ids,
+      options: options && typeof options === "object" ? options : {},
+    };
+
+    const wantClear = !!(payload.options && payload.options.clear);
+
+    if (wantClear) {
+      for (const cid of ids) {
+        patchLiveChatItem(tid, cid, {
+          stream: { transcribe: [] },
+          progress: { transcribe: 0 },
+          segments: { transcribe: [] },
+          updatedAt: nowIso(),
+        });
+
+        clearTranscribeFieldsOnThread(tid, cid);
+      }
+    }
+
+    const ok = wsClientRef.current.send("RETRY_TRANSCRIBE", payload);
+    if (!ok) toast.error("Failed to send RETRY_TRANSCRIBE");
+    return ok;
   };
-
-  const wantClear = !!(payload.options && payload.options.clear);
-
-if (wantClear) {
-  for (const cid of ids) {
-    // wipe live streams/progress/segments immediately
-    patchLiveChatItem(tid, cid, {
-      stream: { transcribe: [] },
-      progress: { transcribe: 0 },
-      segments: { transcribe: [] },
-      updatedAt: nowIso(),
-    });
-
-    // wipe persisted snapshot in local thread state immediately
-    clearTranscribeFieldsOnThread(tid, cid);
-  }
-}
-
-
-  const ok = wsClientRef.current.send("RETRY_TRANSCRIBE", payload);
-  if (!ok) toast.error("Failed to send RETRY_TRANSCRIBE");
-  return ok;
-};
-
 
   const startRun = async ({ itemIds, itemId, options } = {}) => {
     const tid = wsBoundThreadRef.current || activeRef.current;
@@ -1226,10 +1339,21 @@ if (wantClear) {
       mime: originalMime,
       lastModified: file?.lastModified || 0,
       isVideo: originalIsVideo,
+      // durationSeconds will be filled later once mp3File exists (FIX)
     };
 
     if (scope) {
       await putLocalMedia(scope, threadId, clientFileId, file);
+
+      await putLocalMediaMeta(scope, threadId, clientFileId, {
+        origin: "upload",
+        name: file?.name || "",
+        mime: String(file?.type || ""),
+        isVideo: String(file?.type || "").startsWith("video/"),
+        bytes: Number(file?.size || 0) || 0,
+        savedAt: nowIso(),
+      });
+
     }
 
     const draft = ensureDraftShape(t.draft);
@@ -1283,6 +1407,12 @@ if (wantClear) {
           }
         }
 
+        // ✅ FIX: probe duration only AFTER mp3File exists
+        try {
+          const dur = await probeDurationSecondsFromFile(mp3File);
+          if (dur != null) localMeta.durationSeconds = dur;
+        } catch {}
+
         const fd = new FormData();
         fd.append("threadId", threadId);
         fd.append("itemId", itemId);
@@ -1301,12 +1431,28 @@ if (wantClear) {
         const files2 = [...(d2.files || [])];
         const idx2 = files2.findIndex((x) => String(x?.itemId) === String(itemId));
         if (idx2 >= 0) {
+          const prev = files2[idx2] || {};
+          const srv = (r && r.draftFile) ? r.draftFile : {};
+
+          // IMPORTANT: never overwrite these (they point to original local file)
+          const keepClientFileId = prev.clientFileId;
+          const keepLocal = prev.local;
+
           files2[idx2] = {
-            ...files2[idx2],
-            ...(r.draftFile || {}),
-            stage: r?.draftFile?.stage || "uploaded",
+            ...prev,
+            ...srv,
+
+            // preserve original upload identity/meta
+            clientFileId: keepClientFileId,
+            local: keepLocal,
+
+            // if server has extra audio/mp3 fields, merge them separately (optional)
+            audio: { ...(prev.audio || {}), ...(srv.audio || {}) },
+
+            stage: (srv && srv.stage) ? srv.stage : "uploaded",
             updatedAt: nowIso(),
           };
+
         }
 
         const nextT2 = {
@@ -1365,11 +1511,14 @@ if (wantClear) {
     const clientFileId = uuid();
 
     const draft = ensureDraftShape(t.draft);
+
+    // ✅ FIX: don't reference "dur" before it's declared; keep optimistic urlMeta empty
     const optimistic = {
       itemId,
       clientFileId,
       sourceType: "url",
       url: clean,
+      urlMeta: {},
       stage: "linking",
       createdAt: nowIso(),
       updatedAt: nowIso(),
@@ -1390,6 +1539,14 @@ if (wantClear) {
       (async () => {
         const jwt = await getJwtIfAny();
 
+        // ✅ FIX: probe inside the promise, then build urlMeta safely
+        let dur = null;
+        try {
+          dur = await probeDurationSecondsFromUrl(clean);
+        } catch {}
+
+        const urlMeta = dur != null ? { durationSeconds: dur } : {};
+
         const fd = new FormData();
         fd.append("threadId", threadId);
         fd.append("itemId", itemId);
@@ -1397,6 +1554,7 @@ if (wantClear) {
         fd.append("sourceType", "url");
         fd.append("url", clean);
         fd.append("title", t.title || "New Thread");
+        fd.append("urlMeta", JSON.stringify(urlMeta));
 
         const r = await postForm("/api/threads/draft/upload", jwt, fd);
 
@@ -1501,26 +1659,25 @@ if (wantClear) {
   };
 
   const saveSrt = async ({ chatItemId, transcriptSrt, transcriptText }) => {
-  const tid = wsBoundThreadRef.current || activeRef.current;
-  if (!tid || tid === "default") {
-    toast.error("No thread selected.");
-    return false;
-  }
-  if (!wsClientRef.current || !wsClientRef.current.isConnected()) {
-    toast.error("Not connected to the realtime server yet.");
-    return false;
-  }
-  const payload = {
-    threadId: String(tid),
-    chatItemId: String(chatItemId),
-    transcriptSrt: String(transcriptSrt || ""),
-    transcriptText: String(transcriptText || ""),
+    const tid = wsBoundThreadRef.current || activeRef.current;
+    if (!tid || tid === "default") {
+      toast.error("No thread selected.");
+      return false;
+    }
+    if (!wsClientRef.current || !wsClientRef.current.isConnected()) {
+      toast.error("Not connected to the realtime server yet.");
+      return false;
+    }
+    const payload = {
+      threadId: String(tid),
+      chatItemId: String(chatItemId),
+      transcriptSrt: String(transcriptSrt || ""),
+      transcriptText: String(transcriptText || ""),
+    };
+    const ok = wsClientRef.current.send("SAVE_SRT", payload);
+    if (!ok) toast.error("Failed to send SAVE_SRT");
+    return ok;
   };
-  const ok = wsClientRef.current.send("SAVE_SRT", payload);
-  if (!ok) toast.error("Failed to send SAVE_SRT");
-  return ok;
-};
-
 
   const value = {
     loadingThreads,
@@ -1545,7 +1702,7 @@ if (wantClear) {
     wsThreadId,
     liveRunsByThread,
     startRun,
-    retryTranscribe, // ✅
+    retryTranscribe,
     requestThreadSnapshot,
     requestMediaUrl,
 

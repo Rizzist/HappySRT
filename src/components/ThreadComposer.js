@@ -7,6 +7,11 @@ import { useAuth } from "../contexts/AuthContext";
 import { getLocalMedia } from "../lib/mediaStore";
 
 import * as CatalogImport from "../shared/transcriptionCatalog";
+import * as BillingImport from "../shared/billingCatalog";
+
+const Billing = (BillingImport && (BillingImport.default || BillingImport)) || {};
+const { estimateTokensForRun, tokensToUsd, PRICING_VERSION } = Billing;
+
 const Catalog = (CatalogImport && (CatalogImport.default || CatalogImport)) || {};
 const { LANGUAGES, getModelsForLanguage, getModelById } = Catalog;
 
@@ -35,6 +40,26 @@ function safeArr(x) {
   return Array.isArray(x) ? x : [];
 }
 
+function durationSecondsFromDraftFile(f) {
+  const n =
+    f?.local?.durationSeconds ??
+    f?.urlMeta?.durationSeconds ??
+    f?.audio?.durationSeconds ??
+    f?.durationSeconds;
+
+  const x = Number(n);
+  return Number.isFinite(x) && x > 0 ? x : null;
+}
+
+function formatCompact(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return "—";
+  if (x >= 1000000) return `${(x / 1000000).toFixed(x >= 10000000 ? 0 : 1)}m`;
+  if (x >= 10000) return `${Math.round(x / 1000)}k`;
+  if (x >= 1000) return `${(x / 1000).toFixed(1)}k`;
+  return String(Math.round(x));
+}
+
 export default function ThreadComposer({ thread }) {
   const {
     addDraftMediaFromFile,
@@ -46,7 +71,7 @@ export default function ThreadComposer({ thread }) {
     requestThreadSnapshot,
   } = useThreads();
 
-  const { user, isAnonymous } = useAuth();
+  const { user, isAnonymous, mediaTokens } = useAuth();
 
   const [url, setUrl] = useState("");
 
@@ -75,7 +100,6 @@ export default function ThreadComposer({ thread }) {
 
   useEffect(() => {
     if (!asrModelOptions.length) return;
-
     const ok = asrModelOptions.some((m) => String(m?.id || "") === String(asrModel || ""));
     if (!ok) setAsrModel(String(asrModelOptions[0]?.id || "deepgram_nova3"));
   }, [asrLang, asrModelOptions, asrModel]);
@@ -113,7 +137,11 @@ export default function ThreadComposer({ thread }) {
 
       setObjectUrls((prev) => {
         for (const k of Object.keys(prev)) {
-          if (!next[k]) URL.revokeObjectURL(prev[k]);
+          if (!next[k]) {
+            try {
+              URL.revokeObjectURL(prev[k]);
+            } catch {}
+          }
         }
         return next;
       });
@@ -134,14 +162,12 @@ export default function ThreadComposer({ thread }) {
     }
   }, [playingId]);
 
-  // ✅ FIX: depend on `files`, not `.length`
   useEffect(() => {
     if (!playingId) return;
     const stillThere = (files || []).some((f) => String(f?.itemId) === String(playingId));
     if (!stillThere) setPlayingId(null);
   }, [files, playingId]);
 
-  // ✅ FIX: recompute when any file changes (stage, itemId, etc.)
   const readyFiles = useMemo(() => {
     return (files || []).filter((f) => f?.itemId && isReadyDraftFile(f));
   }, [files]);
@@ -158,11 +184,77 @@ export default function ThreadComposer({ thread }) {
   const wsIsReady = String(wsStatus || "") === "ready";
   const hasReadyMedia = readyFiles.length > 0;
 
+  const billingEstimate = useMemo(() => {
+    if (!doTranscribe) return { ok: true, tokens: 0, unknown: 0 };
+
+    if (typeof estimateTokensForRun !== "function") {
+      return { ok: false, tokens: null, unknown: readyFiles.length };
+    }
+
+    const durations = readyFiles.map(durationSecondsFromDraftFile);
+    const unknown = durations.filter((d) => d == null).length;
+
+    if (unknown) return { ok: false, tokens: null, unknown };
+
+    const items = durations.map((d) => ({ durationSeconds: d }));
+    const tokens = estimateTokensForRun(items, asrModel, null);
+    return { ok: true, tokens: Number(tokens || 0) || 0, unknown: 0 };
+  }, [doTranscribe, readyFiles, asrModel]);
+
+  const availableTokens = Number(mediaTokens || 0) || 0;
+  const overLimit = Boolean(doTranscribe && billingEstimate?.ok && billingEstimate.tokens > availableTokens);
+
+  // Minimal badge shown next to "Summarization" pill (right after it)
+  const estimateBadge = useMemo(() => {
+    if (!doTranscribe || !hasReadyMedia) return { show: false };
+
+    if (!billingEstimate?.ok) {
+      const title =
+        billingEstimate?.unknown
+          ? `Missing duration on ${billingEstimate.unknown} file(s) — can’t estimate.`
+          : "Can’t estimate transcription tokens.";
+      return { show: true, text: "—", title, state: "unknown" };
+    }
+
+    const need = Number(billingEstimate.tokens || 0) || 0;
+    const usd = typeof tokensToUsd === "function" ? Number(tokensToUsd(need) || 0) : null;
+
+    // Keep it tiny: show "need/have" compact
+    const text = `${formatCompact(need)}/${formatCompact(availableTokens)}`;
+    const title = [
+      `Est. transcription: ${need} tokens`,
+      usd != null ? `(~$${usd.toFixed(2)})` : null,
+      `Available: ${availableTokens}`,
+      need > availableTokens ? `Short: ${need - availableTokens}` : "Sufficient",
+    ]
+      .filter(Boolean)
+      .join(" • ");
+
+    return { show: true, text, title, state: need > availableTokens ? "bad" : "ok" };
+  }, [doTranscribe, hasReadyMedia, billingEstimate, availableTokens]);
+
   const startUi = useMemo(() => {
-    if (!threadIsValid) return { disabled: true, text: "Select thread", title: "Select a thread to begin" };
-    if (!hasAnyOption) return { disabled: true, text: "Pick options", title: "Choose transcription / translation / summarization" };
+    if (!threadIsValid) return { disabled: true, text: "Select", title: "Select a thread to begin" };
+    if (!hasAnyOption) return { disabled: true, text: "Options", title: "Choose transcription / translation / summarization" };
     if (busyUploading) return { disabled: true, text: "Uploading…", title: "Finish uploading/converting first" };
     if (!hasReadyMedia) return { disabled: true, text: "Add media", title: "Upload/link at least one media file first" };
+
+    if (doTranscribe) {
+      if (!billingEstimate.ok) {
+        return {
+          disabled: true,
+          text: "Duration",
+          title: `Cannot estimate transcription cost: missing duration on ${billingEstimate.unknown} file(s).`,
+        };
+      }
+      if (billingEstimate.tokens > availableTokens) {
+        return {
+          disabled: true,
+          text: "No tokens",
+          title: `Need ${billingEstimate.tokens} tokens, you have ${availableTokens}.`,
+        };
+      }
+    }
 
     if (!wsIsReady) {
       const st = String(wsStatus || "");
@@ -176,7 +268,17 @@ export default function ThreadComposer({ thread }) {
     }
 
     return { disabled: false, text: "Start", title: "Start processing" };
-  }, [threadIsValid, hasAnyOption, busyUploading, hasReadyMedia, wsIsReady, wsStatus]);
+  }, [
+    threadIsValid,
+    hasAnyOption,
+    busyUploading,
+    hasReadyMedia,
+    wsIsReady,
+    wsStatus,
+    doTranscribe,
+    billingEstimate,
+    availableTokens,
+  ]);
 
   const onChooseFiles = async (e) => {
     const picked = Array.from(e.target.files || []);
@@ -261,12 +363,16 @@ export default function ThreadComposer({ thread }) {
 
     const readyIds = readyFiles.map((x) => String(x?.itemId || "")).filter(Boolean);
 
+    if (doTranscribe && billingEstimate?.ok && billingEstimate.tokens > 0) {
+      options.billing = {
+        pricingVersion: PRICING_VERSION || null,
+        expectedTokens: billingEstimate.tokens,
+      };
+    }
+
     const ok = await startRun({ itemIds: readyIds, options });
     if (ok) {
       toast.success("Start sent");
-
-      // ✅ extra safety: ask for a snapshot shortly after start
-      // so draft/chatItems reconcile even if an event is missed.
       setTimeout(() => {
         try {
           requestThreadSnapshot && requestThreadSnapshot();
@@ -422,6 +528,16 @@ export default function ThreadComposer({ thread }) {
           <Pill type="button" $on={doSummarize} onClick={() => setDoSummarize((v) => !v)}>
             Summarization
           </Pill>
+
+          {estimateBadge.show && (
+            <TokenBadge
+              title={estimateBadge.title}
+              $state={estimateBadge.state}
+              aria-label={estimateBadge.title || "Token estimate"}
+            >
+              {estimateBadge.text}
+            </TokenBadge>
+          )}
         </OptionsRow>
 
         {(doTranscribe || doTranslate || doSummarize) && (
@@ -457,7 +573,6 @@ export default function ThreadComposer({ thread }) {
                     </Select>
                   </Field>
                 </Fields>
-
               </Group>
             )}
 
@@ -512,7 +627,6 @@ export default function ThreadComposer({ thread }) {
                 </Fields>
               </Group>
             )}
-
           </Panel>
         )}
       </Box>
@@ -755,6 +869,7 @@ const OptionsRow = styled.div`
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  align-items: center;
 `;
 
 const Pill = styled.button`
@@ -771,6 +886,44 @@ const Pill = styled.button`
   &:hover {
     background: ${(p) => (p.$on ? "rgba(239,68,68,0.12)" : "var(--hover)")};
   }
+`;
+
+// Minimal: a tiny readout right after "Summarization" (need/have).
+// - ok: subtle neutral
+// - bad: red-tinted to convey insufficient
+// - unknown: muted
+const TokenBadge = styled.div`
+  display: inline-flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-weight: 950;
+  font-size: 12px;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  user-select: none;
+  box-shadow: var(--shadow);
+
+  border: 1px solid
+    ${(p) =>
+      p.$state === "bad"
+        ? "rgba(239,68,68,0.32)"
+        : p.$state === "unknown"
+        ? "rgba(0,0,0,0.10)"
+        : "rgba(0,0,0,0.10)"};
+
+  background:
+    ${(p) =>
+      p.$state === "bad"
+        ? "rgba(239,68,68,0.12)"
+        : p.$state === "unknown"
+        ? "rgba(0,0,0,0.03)"
+        : "rgba(255,255,255,0.55)"};
+
+  color: ${(p) => (p.$state === "bad" ? "var(--accent)" : p.$state === "unknown" ? "var(--muted)" : "var(--text)")};
+
+  backdrop-filter: blur(7px);
 `;
 
 const Panel = styled.div`
@@ -835,5 +988,3 @@ const Select = styled.select`
     box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.1);
   }
 `;
-
-
