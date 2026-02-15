@@ -13,7 +13,6 @@ function makeAppwrite() {
   const project = process.env.NEXT_PUBLIC_APPWRITE_PROJECT_ID;
 
   if (!endpoint || !project) {
-    // Don't hard-crash SSR; just throw in client runtime usage
     throw new Error("Missing Appwrite env (NEXT_PUBLIC_APPWRITE_ENDPOINT/PROJECT_ID)");
   }
 
@@ -43,6 +42,16 @@ async function fetchTokensWithJwt(jwt) {
   return data;
 }
 
+function sumObjNumbers(obj) {
+  const o = obj && typeof obj === "object" ? obj : {};
+  let total = 0;
+  for (const v of Object.values(o)) {
+    const n = Number(v);
+    if (Number.isFinite(n) && n > 0) total += n;
+  }
+  return total;
+}
+
 export function AuthProvider({ children }) {
   const appwriteRef = useRef(null);
   const jwtCacheRef = useRef({ jwt: null, at: 0 });
@@ -51,19 +60,55 @@ export function AuthProvider({ children }) {
   const [loadingAuth, setLoadingAuth] = useState(true);
   const [isAnonymous, setIsAnonymous] = useState(true);
 
-  // Optional, but handy if you show tokens in UI
+  // Authoritative server snapshot
   const [tokens, setTokens] = useState({
-    mediaTokens: 0,
+    mediaTokens: 0, // available
     mediaTokensBalance: 0,
-    mediaTokensReserved: 0,
+    mediaTokensReserved: 0, // server reserved
     provider: null,
     pricingVersion: null,
     serverTime: null,
   });
 
+  // ✅ Client optimistic reservations (blue “potential used”)
+  // key -> token amount
+  const [optimisticReservedByKey, setOptimisticReservedByKey] = useState({});
+
+  const optimisticReserved = useMemo(() => {
+    return sumObjNumbers(optimisticReservedByKey);
+  }, [optimisticReservedByKey]);
+
+  const reserveMediaTokens = (key, amount) => {
+    const k = String(key || "").trim();
+    const n = Math.max(0, Number(amount || 0) || 0);
+    if (!k || n <= 0) return;
+
+    setOptimisticReservedByKey((prev) => {
+      const cur = prev && typeof prev === "object" ? prev : {};
+      // avoid churn if same
+      if (Number(cur[k] || 0) === n) return prev;
+      return { ...cur, [k]: n };
+    });
+  };
+
+  const releaseMediaTokens = (key) => {
+    const k = String(key || "").trim();
+    if (!k) return;
+    setOptimisticReservedByKey((prev) => {
+      const cur = prev && typeof prev === "object" ? prev : {};
+      if (!hasOwn(cur, k)) return prev;
+      const next = { ...cur };
+      delete next[k];
+      return next;
+    });
+  };
+
+  const clearAllMediaReservations = () => {
+    setOptimisticReservedByKey({});
+  };
 
   // ✅ allow WS (and other sources) to update token state safely with partial payloads
- const applyTokensSnapshot = (snap) => {
+  const applyTokensSnapshot = (snap) => {
     if (!snap || typeof snap !== "object") return;
 
     setTokens((prev) => {
@@ -103,7 +148,6 @@ export function AuthProvider({ children }) {
     if (typeof window === "undefined") return null;
     const account = getAccount();
 
-    // Cache a JWT briefly to avoid spamming createJWT on every request.
     const now = Date.now();
     const cached = jwtCacheRef.current || {};
     if (!force && cached.jwt && now - (cached.at || 0) < 3 * 60 * 1000) {
@@ -121,7 +165,6 @@ export function AuthProvider({ children }) {
     }
   };
 
-  // ✅ This is the actual "3)" logic: call /api/auth/tokens after login/restore
   const refreshTokens = async ({ forceJwt } = {}) => {
     if (isAnonymous) return null;
 
@@ -142,7 +185,7 @@ export function AuthProvider({ children }) {
     return data;
   };
 
-  // Boot: restore session (auto-login) then refresh tokens once
+  // Boot: restore session then refresh tokens once
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -152,7 +195,6 @@ export function AuthProvider({ children }) {
         if (!alive) return;
 
         if (u?.$id) {
-          // will auto-grant to 50 for google after your server-side fix
           await refreshTokens({ forceJwt: true });
         }
       } finally {
@@ -166,7 +208,6 @@ export function AuthProvider({ children }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // If user changes from logged out -> logged in in-app, refresh tokens again
   useEffect(() => {
     if (!user?.$id) return;
     if (isAnonymous) return;
@@ -175,15 +216,16 @@ export function AuthProvider({ children }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.$id, isAnonymous]);
 
-  // Optional helpers (useful for UI buttons)
   const logout = async () => {
     try {
       const account = getAccount();
       await account.deleteSessions();
     } catch {}
+
     jwtCacheRef.current = { jwt: null, at: 0 };
     setUser(null);
     setIsAnonymous(true);
+    setOptimisticReservedByKey({});
     setTokens({
       mediaTokens: 0,
       mediaTokensBalance: 0,
@@ -194,9 +236,21 @@ export function AuthProvider({ children }) {
     });
   };
 
+  const tokenSnapshot = {
+    mediaTokens: tokens.mediaTokens,
+    mediaTokensBalance: tokens.mediaTokensBalance,
+    mediaTokensReserved: tokens.mediaTokensReserved,
+    provider: tokens.provider || null,
+    pricingVersion: tokens.pricingVersion || null,
+    serverTime: tokens.serverTime || null,
+  };
+
   const value = useMemo(() => {
+    const serverReserved = Number(tokens.mediaTokensReserved || 0) || 0;
+
     return {
       user,
+      loading: loadingAuth,
       loadingAuth,
       isAnonymous,
 
@@ -205,13 +259,25 @@ export function AuthProvider({ children }) {
       refreshTokens,
       applyTokensSnapshot,
 
-      // optional token state (if you want to show it in UI)
+      // server snapshot
       tokens,
       mediaTokens: tokens.mediaTokens,
+      tokenSnapshot,
+
+      // ✅ pending = server reserved + optimistic reserved (“blue potential used”)
+      pendingMediaTokens: Math.max(0, serverReserved + optimisticReserved),
+
+      // ✅ optimistic reservation API (client-side)
+      reserveMediaTokens,
+      releaseMediaTokens,
+      clearAllMediaReservations,
+
+      // helpful for debugging UI
+      optimisticReserved,
 
       logout,
     };
-  }, [user, loadingAuth, isAnonymous, tokens]);
+  }, [user, loadingAuth, isAnonymous, tokens, optimisticReserved]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

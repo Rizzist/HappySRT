@@ -1,3 +1,4 @@
+// pages/index.js
 import AppShell from "../components/AppShell";
 import BootScreen from "../components/BootScreen";
 import { useAuth } from "../contexts/AuthContext";
@@ -10,6 +11,8 @@ export default function Home() {
     loading: authLoading,
     isAnonymous,
     mediaTokens,
+    tokenSnapshot,
+    pendingMediaTokens,
     loginWithGoogle,
     logout,
   } = useAuth();
@@ -51,6 +54,8 @@ export default function Home() {
           user={user}
           isAnonymous={isAnonymous}
           mediaTokens={mediaTokens}
+          tokenSnapshot={tokenSnapshot}
+          pendingMediaTokens={pendingMediaTokens}
           onGoogleLogin={loginWithGoogle}
           onLogout={logout}
         />

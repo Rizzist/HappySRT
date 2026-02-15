@@ -5,7 +5,17 @@ import Sidebar from "./Sidebar";
 import ThreadView from "./ThreadView";
 import { useThreads } from "../contexts/threadsContext";
 
-export default function AppShell({ user, isAnonymous, mediaTokens, onGoogleLogin, onLogout }) {
+export default function AppShell({
+  user,
+  isAnonymous,
+
+  mediaTokens,
+  tokenSnapshot,
+  pendingMediaTokens,
+
+  onGoogleLogin,
+  onLogout,
+}) {
   const { threads, activeId, setActiveId, activeThread, loadingThreads, createThread } = useThreads();
   const [collapsed, setCollapsed] = useState(false);
 
@@ -21,6 +31,8 @@ export default function AppShell({ user, isAnonymous, mediaTokens, onGoogleLogin
         user={user}
         isAnonymous={isAnonymous}
         mediaTokens={mediaTokens}
+        tokenSnapshot={tokenSnapshot}
+        pendingMediaTokens={pendingMediaTokens}
         onGoogleLogin={onGoogleLogin}
         onLogout={onLogout}
       />

@@ -1,6 +1,7 @@
 // components/ChatTimeline.js
 import { useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
+import { useAuth } from "../contexts/AuthContext";
 import { createPortal } from "react-dom";
 import { useThreads } from "../contexts/threadsContext";
 import ChatMediaPlayer from "./ChatMediaPlayer";
@@ -9,6 +10,11 @@ import LegacySrtSegmentsEditor from "./LegacySrtSegmentsEditor";
 import * as CatalogImport from "../shared/transcriptionCatalog";
 const Catalog = (CatalogImport && (CatalogImport.default || CatalogImport)) || {};
 const { LANGUAGES, getModelsForLanguage } = Catalog;
+
+// ✅ NEW: billing helpers for client-side estimates
+import * as BillingImport from "../shared/billingCatalog";
+const Billing = (BillingImport && (BillingImport.default || BillingImport)) || {};
+const { estimateTokensForSeconds, tokensToUsd } = Billing;
 
 function normalizeWhitespace(t) {
   return String(t || "").replace(/\s+/g, " ").trim();
@@ -20,6 +26,29 @@ function segKey(seg) {
   const t = normalizeWhitespace(seg?.text || "");
   return `${s.toFixed(3)}|${e.toFixed(3)}|${t}`;
 }
+
+function isRtlLang(lang) {
+  const base = String(lang || "")
+    .toLowerCase()
+    .trim()
+    .split(/[-_]/)[0];
+
+  // common RTL languages
+  return ["ar", "fa", "he", "ur", "ps", "dv", "ku", "ug", "yi", "sd"].includes(base);
+}
+
+function looksRtlText(text) {
+  const t = String(text || "");
+  // Hebrew + Arabic ranges (good enough heuristic)
+  return /[\u0591-\u07FF\uFB1D-\uFDFD\uFE70-\uFEFC]/.test(t);
+}
+
+function dirFromLangAndSample(lang, sampleText) {
+  const l = String(lang || "").toLowerCase().trim();
+  if (!l || l === "auto") return looksRtlText(sampleText) ? "rtl" : "ltr";
+  return isRtlLang(l) ? "rtl" : "ltr";
+}
+
 
 function mergeSegments(a, b) {
   const A = Array.isArray(a) ? a : [];
@@ -38,11 +67,7 @@ function mergeSegments(a, b) {
     out.push(seg);
   }
 
-  out.sort(
-    (x, y) =>
-      (Number(x?.start || 0) - Number(y?.start || 0)) ||
-      (Number(x?.end || 0) - Number(y?.end || 0))
-  );
+  out.sort((x, y) => (Number(x?.start || 0) - Number(y?.start || 0)) || (Number(x?.end || 0) - Number(y?.end || 0)));
   return out;
 }
 
@@ -70,7 +95,6 @@ function deriveStage(stepStatus, stepName) {
   return state || "—";
 }
 
-// If edited SRT exists, parse it into segments so highlight+seek match edits
 function parseTimecodeToSeconds(tc) {
   const s = String(tc || "").trim();
   const m = s.match(/^(\d+):(\d+):(\d+),(\d+)$/);
@@ -128,6 +152,15 @@ function stateTone(stepStatus) {
   return "idle";
 }
 
+function formatCompact(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return "—";
+  if (x >= 1000000) return `${(x / 1000000).toFixed(x >= 10000000 ? 0 : 1)}m`;
+  if (x >= 10000) return `${Math.round(x / 1000)}k`;
+  if (x >= 1000) return `${(x / 1000).toFixed(1)}k`;
+  return String(Math.round(x));
+}
+
 function pickDefaultModelIdForLang(lang) {
   const l = String(lang || "auto") || "auto";
   if (typeof getModelsForLanguage !== "function") return "deepgram_nova3";
@@ -152,30 +185,76 @@ function fmtClock(seconds) {
   return `${pad(mm)}:${pad(ss)}`;
 }
 
+// ✅ NEW: robust duration getter for client-side estimation
+function durationSecondsFromChatItem(it) {
+  const media = it?.media || {};
+  const n =
+    media?.durationSeconds ??
+    media?.duration ??
+    media?.meta?.durationSeconds ??
+    media?.meta?.duration ??
+    media?.urlMeta?.durationSeconds ??
+    media?.audio?.durationSeconds ??
+    it?.durationSeconds ??
+    it?.audio?.durationSeconds ??
+    it?.urlMeta?.durationSeconds ??
+    it?.results?.transcriptMeta?.durationSeconds ??
+    it?.results?.mediaMeta?.durationSeconds ??
+    null;
+
+  const x = Number(n);
+  return Number.isFinite(x) && x > 0 ? x : null;
+}
+
 export default function ChatTimeline({ thread, showEmpty = true }) {
   const { liveRunsByThread, retryTranscribe, saveSrt } = useThreads();
 
   const [tabByItem, setTabByItem] = useState({});
-  const [transViewByItem, setTransViewByItem] = useState({}); // srt | text
+  const [transViewByItem, setTransViewByItem] = useState({});
   const [timeByItem, setTimeByItem] = useState({});
 
-  // dropdown state (only for T)
-  const [openMenuFor, setOpenMenuFor] = useState(null); // chatItemId
+  const [openMenuFor, setOpenMenuFor] = useState(null);
   const anchorElRef = useRef(null);
   const menuElRef = useRef(null);
-  const [menuPos, setMenuPos] = useState(null); // { top, left, width, placement }
+  const [menuPos, setMenuPos] = useState(null);
 
-  const [transOptsByItem, setTransOptsByItem] = useState({}); // chatItemId -> { language, modelId }
+  const [transOptsByItem, setTransOptsByItem] = useState({});
 
-  // store player APIs so transcript clicks can seek
-  const playerApisRef = useRef({}); // chatItemId -> api
+  const playerApisRef = useRef({});
 
-  // editor refs + meta (dirty/invalid) so Save/Reset can live in Output header
-  const srtEditorRefsRef = useRef({}); // chatItemId -> ref api
-  const [srtMetaByItem, setSrtMetaByItem] = useState({}); // chatItemId -> { dirty, hasBadTime }
+  const srtEditorRefsRef = useRef({});
+  const [srtMetaByItem, setSrtMetaByItem] = useState({});
 
-  // optimistic saved srt so UI instantly reflects save
-  const [optimisticSrtByItem, setOptimisticSrtByItem] = useState({}); // chatItemId -> srt string
+  const [optimisticSrtByItem, setOptimisticSrtByItem] = useState({});
+
+    // ✅ NEW: token gating for client-side actions
+  const { tokenSnapshot, mediaTokens, pendingMediaTokens } = useAuth();
+
+  // ✅ unused = availableRaw - optimisticEffective (capped)
+  const availableUnused = useMemo(() => {
+    const availableRaw =
+      tokenSnapshot && typeof tokenSnapshot.mediaTokens === "number"
+        ? tokenSnapshot.mediaTokens
+        : typeof mediaTokens === "number"
+        ? mediaTokens
+        : 0;
+
+    const serverReserved =
+      tokenSnapshot && typeof tokenSnapshot.mediaTokensReserved === "number"
+        ? tokenSnapshot.mediaTokensReserved
+        : 0;
+
+    const pendingRaw = typeof pendingMediaTokens === "number" ? pendingMediaTokens : serverReserved;
+
+    const baseAvailable = Math.max(0, Number(availableRaw || 0));
+    const baseServerReserved = Math.max(0, Number(serverReserved || 0));
+    const basePending = Math.max(0, Number(pendingRaw || 0));
+
+    const optimisticRequested = Math.max(0, basePending - baseServerReserved);
+    const optimisticEffective = Math.min(optimisticRequested, baseAvailable);
+
+    return Math.max(0, baseAvailable - optimisticEffective);
+  }, [tokenSnapshot, mediaTokens, pendingMediaTokens]);
 
   const items = useMemo(() => {
     const arr = safeArr(thread?.chatItems);
@@ -184,7 +263,6 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
       .sort((a, b) => (Date.parse(b?.createdAt || 0) || 0) - (Date.parse(a?.createdAt || 0) || 0));
   }, [thread?.chatItems]);
 
-  // clear optimistic entries once thread results catch up
   useEffect(() => {
     setOptimisticSrtByItem((prev) => {
       const next = { ...(prev || {}) };
@@ -215,14 +293,12 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
 
     const rect = anchor.getBoundingClientRect();
 
-    // smaller menu
     const width = Math.min(420, Math.max(300, Math.floor(window.innerWidth * 0.36)));
     const pad = 12;
 
     let left = rect.right - width;
     left = Math.max(pad, Math.min(left, window.innerWidth - width - pad));
 
-    // default: open downward
     let top = rect.bottom + 8;
     let placement = "bottom";
 
@@ -237,7 +313,6 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
     const mr = menuElRef.current.getBoundingClientRect();
     const pad = 12;
 
-    // if it overflows bottom and we have space above, flip upward
     if (mr.bottom > window.innerHeight - pad) {
       const anchorTop = Number(menuPos?._anchorTop || 0);
       const desiredTop = anchorTop - mr.height - 8;
@@ -325,7 +400,7 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
         const sum = status?.summarize || {};
 
         const transState = String(trans?.state || "");
-        const isTranscribing = transState === "running";
+        const isTranscribing = transState === "running" || transState === "queued";
 
         const persistedSrtRaw = String(results?.transcriptSrt || "");
         const optimisticSrt = String(optimisticSrtByItem?.[chatItemId] || "");
@@ -339,7 +414,7 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
           : [];
 
         const liveSegs = Array.isArray(liveOne?.segments?.transcribe) ? liveOne.segments.transcribe : [];
-        const mergedSegs = isTranscribing ? mergeSegments(persistedSegs, liveSegs) : persistedSegs;
+        const mergedSegs = transState === "running" ? mergeSegments(persistedSegs, liveSegs) : persistedSegs;
 
         const segPlain = segmentsToPlainText(mergedSegs);
 
@@ -386,14 +461,113 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
             ? String(opts.modelId || "")
             : String(modelsForLang?.[0]?.id || pickDefaultModelIdForLang(opts.language));
 
-        const canReTranscribe = String(trans?.state || "") !== "running";
+        const canReTranscribeState = !isTranscribing; // includes queued + running
+
+
+        // ======================
+        // ✅ COST (actual vs estimate; actual wins)
+        // ======================
+        const costTokensRaw =
+          // ✅ NEW persisted actual fields (server writes these into CRDB)
+          trans?.actualTokensUsed ??
+          trans?.costTokens ??
+          trans?.billingTokens ??
+          // fallback legacy fields
+          trans?.tokens ??
+          it?.billing?.transcribeTokens ??
+          it?.billing?.mediaTokens ??
+          it?.billing?.tokens ??
+          it?.transcribeTokens ??
+          it?.mediaTokens ??
+          results?.transcriptMeta?.actualTokensUsed ??
+          results?.transcriptMeta?.billingTokens ??
+          results?.transcriptMeta?.tokens ??
+          liveOne?.billing?.transcribeTokens ??
+          liveOne?.billing?.mediaTokens ??
+          liveOne?.billing?.tokens ??
+          live?.billingByChatItemId?.[chatItemId];
+
+        const hasCostField = costTokensRaw != null && String(costTokensRaw) !== "";
+        const costTokens = Math.max(0, Number(costTokensRaw || 0) || 0);
+
+        const potentialRaw =
+          // ✅ NEW persisted estimate fields (server writes these into CRDB)
+          trans?.potentialTokens ??
+          trans?.estimatedTokens ??
+          trans?.expectedTokens ??
+          results?.transcriptMeta?.potentialTokens ??
+          results?.transcriptMeta?.estimatedTokens ??
+          // existing live estimation fields
+          liveOne?.billing?.potentialTokens ??
+          it?.billing?.potentialTokens ??
+          liveOne?.potentialTokens ??
+          it?.potentialTokens ??
+          null;
+
+        const hasPotentialField = potentialRaw != null && String(potentialRaw) !== "";
+        const potentialTokens = Math.max(0, Number(potentialRaw || 0) || 0);
+
+        // ✅ NEW: client-side estimate when server hasn't provided either actual or estimate yet
+        const durationSeconds = durationSecondsFromChatItem(it);
+        const clientEstimateTokens =
+          !hasCostField &&
+          !hasPotentialField &&
+          durationSeconds != null &&
+          typeof estimateTokensForSeconds === "function"
+            ? Math.max(0, Number(estimateTokensForSeconds(durationSeconds, effectiveModelId, null) || 0) || 0)
+            : 0;
+
+        // Determine what we show in the pill
+        const displayKind =
+          // if actual exists (including 0), treat as actual
+          hasCostField ? "actual" :
+          // else if server estimate exists (including 0), treat as potential
+          hasPotentialField ? "potential" :
+          // else fallback to client estimate if we can
+          clientEstimateTokens > 0 ? "client" :
+          // else unknown (avoid showing 0)
+          "unknown";
+
+        const displayTokens =
+          displayKind === "actual"
+            ? costTokens
+            : displayKind === "potential"
+            ? potentialTokens
+            : displayKind === "client"
+            ? clientEstimateTokens
+            : null;
+
+        const pillState =
+          displayKind === "potential" || displayKind === "client"
+            ? "potential"
+            : isBusy(trans)
+            ? "pending"
+            : transState === "failed"
+            ? "failed"
+            : transState === "done"
+            ? "done"
+            : "idle";
+
+        const modelLabel =
+          modelsForLang.find((m) => String(m?.id || "") === String(effectiveModelId || ""))?.label || effectiveModelId;
+
+        const usdApprox =
+          displayTokens != null && typeof tokensToUsd === "function" ? Number(tokensToUsd(displayTokens) || 0) : null;
+
+        const pillTitle =
+          displayKind === "actual"
+            ? `Transcription cost: ${costTokens} tokens`
+            : displayKind === "potential"
+            ? `Estimated transcription cost: ~${potentialTokens} tokens`
+            : displayKind === "client"
+            ? `Client estimate: ~${clientEstimateTokens} tokens${durationSeconds ? ` • duration ${fmtClock(durationSeconds)}` : ""} • ${modelLabel}`
+            : `No estimate yet${durationSeconds ? "" : " (missing duration)"}${modelLabel ? ` • ${modelLabel}` : ""}`;
 
         const openMenu = (e) => {
           if (!isBrowser) return;
           const el = e?.currentTarget;
           if (!el) return;
 
-          // seed options on first open
           setTransOptsByItem((p) => {
             const cur = p?.[chatItemId];
             if (cur) return p || {};
@@ -425,7 +599,6 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
           if (api && typeof api.seek === "function") api.seek(t);
         };
 
-        // single button that covers retry + re-transcribe + "apply current settings"
         const doReTranscribe = () => {
           setTabByItem((p) => ({ ...(p || {}), [chatItemId]: "transcribe" }));
           setTransViewByItem((p) => ({ ...(p || {}), [chatItemId]: "srt" }));
@@ -463,6 +636,19 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
           if (api && typeof api.save === "function") api.save();
         };
 
+      const langForDir = String(trans?.language || opts?.language || seedLang || "auto") || "auto";
+
+      const sampleForDir = normalizeWhitespace(
+        (mergedSegs || [])
+          .slice(0, 12)
+          .map((s) => String(s?.text || ""))
+          .join(" ")
+      ) || normalizeWhitespace(showText || segPlain || fallbackStream || "");
+
+      const textDir = dirFromLangAndSample(langForDir, sampleForDir);
+
+
+
         const transcriptionBody =
           transView === "srt" ? (
             <SrtModeWrap>
@@ -485,7 +671,6 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
                   setSrtMetaByItem((p) => ({ ...(p || {}), [chatItemId]: m || {} }));
                 }}
                 onSave={({ transcriptSrt, transcriptText }) => {
-                  // optimistic UI
                   setOptimisticSrtByItem((p) => ({ ...(p || {}), [chatItemId]: String(transcriptSrt || "") }));
                   saveSrt({ chatItemId, transcriptSrt, transcriptText });
                 }}
@@ -499,14 +684,15 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
               ) : null}
             </SrtModeWrap>
           ) : mergedSegs.length ? (
-            <TextSnippets aria-label="Transcript text (clickable)">
-              {mergedSegs.map((seg, idx) => {
+            <TextSnippets aria-label="Transcript text (clickable)" dir={textDir} $dir={textDir}>
+                {mergedSegs.map((seg, idx) => {
                 const txt = normalizeWhitespace(seg?.text || "");
                 if (!txt) return null;
 
                 const active = isActiveAtTime(seg, curTime);
                 return (
                   <Snippet
+                    dir="auto"
                     key={`${segKey(seg)}|${idx}`}
                     $active={active}
                     title={`${fmtClock(seg?.start)} → ${fmtClock(seg?.end)} (click to seek)`}
@@ -514,6 +700,7 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
                   >
                     {txt}
                   </Snippet>
+
                 );
               })}
             </TextSnippets>
@@ -521,12 +708,45 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
             <Text>{showText || segPlain || fallbackStream || "—"}</Text>
           );
 
-        const outputBody =
-          tab === "transcribe" ? (
-            transcriptionBody
-          ) : (
-            <Text>{showText || fallbackStream || "—"}</Text>
-          );
+        const outputBody = tab === "transcribe" ? transcriptionBody : <Text>{showText || fallbackStream || "—"}</Text>;
+
+        
+                // ✅ NEW: estimate shown next to Re-transcribe (uses current effectiveModelId)
+const rerunTokens =
+  durationSeconds != null && typeof estimateTokensForSeconds === "function"
+    ? Math.max(0, Number(estimateTokensForSeconds(durationSeconds, effectiveModelId, null) || 0) || 0)
+    : null;
+
+const rerunUsd =
+  rerunTokens != null && typeof tokensToUsd === "function" ? Number(tokensToUsd(rerunTokens) || 0) : null;
+
+// ✅ NEW: token gating
+const rerunAffordable = rerunTokens == null ? true : rerunTokens <= availableUnused;
+const canReTranscribe = canReTranscribeState && rerunAffordable;
+
+const rerunTitle =
+  rerunTokens == null
+    ? "Need duration to estimate re-transcription cost."
+    : rerunAffordable
+    ? [
+        `Estimated re-transcribe: ~${rerunTokens} tokens`,
+        rerunUsd != null ? `(~$${rerunUsd.toFixed(2)})` : null,
+        durationSeconds ? `duration ${fmtClock(durationSeconds)}` : null,
+        modelLabel ? `${modelLabel}` : null,
+      ]
+        .filter(Boolean)
+        .join(" • ")
+    : [
+        `Not enough media tokens`,
+        `need ~${rerunTokens}`,
+        `have ${availableUnused} unused`,
+        rerunUsd != null ? `(~$${rerunUsd.toFixed(2)})` : null,
+        durationSeconds ? `duration ${fmtClock(durationSeconds)}` : null,
+        modelLabel ? `${modelLabel}` : null,
+      ]
+        .filter(Boolean)
+        .join(" • ");
+
 
         return (
           <Card key={chatItemId}>
@@ -545,6 +765,14 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
                   <Dot $tone={toneT} />
                   <StepK> T </StepK>
                   <StepV>{deriveStage(trans, "transcribe")}</StepV>
+
+                  <CostPill $state={pillState} title={pillTitle}>
+                    {displayKind === "potential" || displayKind === "client" ? "~" : ""}
+                    {displayKind === "unknown" ? "—" : formatCompact(displayTokens)}
+                    {" "}
+                    tok
+                  </CostPill>
+
                   {isBusy(trans) ? <Spinner /> : null}
                   <Caret $open={isMenuOpen}>▾</Caret>
                 </StepBtn>
@@ -655,7 +883,6 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
               </Right>
             </Grid>
 
-            {/* Dropdown (Portal) */}
             {isBrowser && isMenuOpen && menuPos
               ? createPortal(
                   <Menu
@@ -680,19 +907,34 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
                     </MenuTop>
 
                     <MenuRow>
-                      <MenuAction
-                        type="button"
-                        onClick={doReTranscribe}
-                        disabled={!canReTranscribe}
-                        title={isTranscribing ? "Transcription is running" : "Retry / re-run with these settings"}
-                      >
-                        Re-transcribe
-                      </MenuAction>
+
+
+<MenuAction
+  type="button"
+  onClick={doReTranscribe}
+  disabled={!canReTranscribe}
+  title={
+    isTranscribing
+      ? "Transcription is running"
+      : !rerunAffordable
+      ? `Not enough media tokens (need ~${rerunTokens}, have ${availableUnused} unused)`
+      : "Retry / re-run with these settings"
+  }
+>
+  Re-transcribe
+</MenuAction>
+
+<MenuEstimatePill
+  $state={rerunTokens == null ? "unknown" : rerunAffordable ? "potential" : "failed"}
+  title={rerunTitle}
+>
+  {rerunTokens == null ? "—" : "~" + formatCompact(rerunTokens)} tok
+</MenuEstimatePill>
+
                     </MenuRow>
 
                     <MenuDivider />
 
-                    {/* Language + Model dropdowns (like composer) */}
                     <MenuField>
                       <MenuLabel>Language</MenuLabel>
 
@@ -702,7 +944,6 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
                           onChange={(e) => {
                             const nextLang = String(e?.target?.value || "auto") || "auto";
 
-                            // adjust model if it doesn't exist for the new language
                             const models =
                               typeof getModelsForLanguage === "function" ? safeArr(getModelsForLanguage(nextLang)) : [];
 
@@ -789,6 +1030,7 @@ export default function ChatTimeline({ thread, showEmpty = true }) {
   );
 }
 
+// styles unchanged except CostPill adds a new state "potential"
 const List = styled.div`
   display: flex;
   flex-direction: column;
@@ -800,7 +1042,7 @@ const Card = styled.div`
   background: var(--panel);
   border-radius: 18px;
   box-shadow: var(--shadow);
-  overflow: hidden; /* portal dropdown avoids clipping now */
+  overflow: hidden;
 `;
 
 const CardHead = styled.div`
@@ -1113,7 +1355,7 @@ const SwitchBtn = styled.button`
 const SrtModeWrap = styled.div`
   display: flex;
   flex-direction: column;
-  gap: 8px; /* tighter */
+  gap: 8px;
 `;
 
 const LiveTextHint = styled.div`
@@ -1137,29 +1379,51 @@ const LiveTextBody = styled.div`
   white-space: pre-wrap;
 `;
 
-/* clickable "Text mode" snippets based on SRT segments */
 const TextSnippets = styled.div`
-  font-size: 12px;
+  font-size: 15px; /* ✅ slightly bigger than 13 */
   color: var(--text);
-  line-height: 1.45;
-  white-space: normal;
+  line-height: 1.6;
+
+  /* ✅ flex wrapping gives PERFECT rtl/ltr segment flow */
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1px 2px; /* ✅ much tighter spacing */
+
+  /* ✅ enforce direction strongly (in case any global css fights it) */
+  direction: ${(p) => (p.$dir === "rtl" ? "rtl" : "ltr")} !important;
+  text-align: ${(p) => (p.$dir === "rtl" ? "right" : "left")} !important;
+
+  /* keeps bidi sane across a lot of inline pills */
+  unicode-bidi: isolate;
 `;
 
 const Snippet = styled.span`
-  display: inline-block;
-  padding: 1px 5px;       /* tighter */
-  margin: 0 4px 4px 0;    /* tighter */
+  display: inline-flex;
+  align-items: center;
+
+  /* ✅ remove margin spacing completely (gap handles it) */
+  margin: 0;
+
+  /* ✅ slightly tighter pill */
+  padding: 0px 2px;
+
   border-radius: 8px;
   border: 1px solid ${(p) => (p.$active ? "rgba(239,68,68,0.22)" : "transparent")};
   background: ${(p) => (p.$active ? "rgba(239,68,68,0.12)" : "transparent")};
+
   cursor: pointer;
   user-select: none;
+
+  /* each snippet can be mixed language cleanly */
+  unicode-bidi: plaintext;
 
   &:hover {
     background: ${(p) => (p.$active ? "rgba(239,68,68,0.14)" : "rgba(0,0,0,0.04)")};
     border-color: ${(p) => (p.$active ? "rgba(239,68,68,0.26)" : "rgba(0,0,0,0.10)")};
   }
 `;
+
+
 
 const EmptyCard = styled.div`
   border: 1px solid var(--border);
@@ -1179,8 +1443,6 @@ const EmptySub = styled.div`
   font-size: 12px;
   color: var(--muted);
 `;
-
-/* Dropdown Menu (Portal) */
 
 const Menu = styled.div`
   border: 1px solid var(--border);
@@ -1225,6 +1487,7 @@ const MenuRow = styled.div`
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  align-items: center;
 `;
 
 const MenuAction = styled.button`
@@ -1305,4 +1568,50 @@ const MenuNote = styled.div`
   color: var(--muted);
   font-weight: 800;
   line-height: 1.35;
+`;
+
+const CostPill = styled.span`
+  font-size: 10px;
+  font-weight: 950;
+  padding: 2px 7px;
+  border-radius: 999px;
+  white-space: nowrap;
+
+  border: 1px solid
+    ${(p) =>
+      p.$state === "failed"
+        ? "rgba(239,68,68,0.30)"
+        : p.$state === "pending"
+        ? "rgba(245,158,11,0.30)"
+        : p.$state === "potential"
+        ? "rgba(59,130,246,0.35)"
+        : "rgba(0,0,0,0.10)"};
+
+  background:
+    ${(p) =>
+      p.$state === "failed"
+        ? "rgba(239,68,68,0.10)"
+        : p.$state === "pending"
+        ? "rgba(245,158,11,0.10)"
+        : p.$state === "potential"
+        ? "rgba(59,130,246,0.10)"
+        : "rgba(255,255,255,0.55)"};
+
+  color:
+    ${(p) =>
+      p.$state === "failed"
+        ? "rgba(239,68,68,0.95)"
+        : p.$state === "pending"
+        ? "rgba(245,158,11,0.95)"
+        : p.$state === "potential"
+        ? "rgba(59,130,246,1)"
+        : "var(--text)"};
+
+  backdrop-filter: blur(7px);
+`;
+
+// ✅ NEW: a slightly larger pill for the menu row estimate
+const MenuEstimatePill = styled(CostPill)`
+  font-size: 11px;
+  padding: 6px 10px;
 `;

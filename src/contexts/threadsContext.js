@@ -10,6 +10,9 @@ import { createThreadWsClient } from "../lib/wsThreadsClient";
 import { putMediaIndex, getMediaIndex } from "../lib/mediaIndexStore";
 import { putLocalMediaMeta } from "../lib/mediaMetaStore";
 
+import * as BillingImport from "../shared/billingCatalog";
+const Billing = (BillingImport && (BillingImport.default || BillingImport)) || {};
+
 const ThreadsContext = createContext(null);
 
 function toArray(threadsById) {
@@ -99,7 +102,6 @@ function ensureServerShape(s) {
   return out;
 }
 
-// --- Fix #2 helpers ---
 function isBusyDraftFile(f) {
   const stage = String(f?.stage || "");
   return stage === "uploading" || stage === "converting" || stage === "linking";
@@ -151,6 +153,101 @@ function applyChatItemPatch(item, patch) {
     results: p.results ? { ...(item?.results || {}), ...(p.results || {}) } : item?.results || {},
     updatedAt: p.updatedAt || item?.updatedAt || nowIso(),
   };
+}
+
+function hasOwn(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj || {}, key);
+}
+
+// prevents the “flash to 0” by ONLY passing fields that actually exist
+function pickTokenPatch(raw) {
+  const p = raw && typeof raw === "object" ? raw : null;
+  if (!p) return null;
+
+  const out = {};
+  if (hasOwn(p, "mediaTokens")) out.mediaTokens = p.mediaTokens;
+  if (hasOwn(p, "mediaTokensBalance")) out.mediaTokensBalance = p.mediaTokensBalance;
+  if (hasOwn(p, "mediaTokensReserved")) out.mediaTokensReserved = p.mediaTokensReserved;
+  if (hasOwn(p, "pricingVersion")) out.pricingVersion = p.pricingVersion || null;
+  if (hasOwn(p, "serverTime")) out.serverTime = p.serverTime || p.ts || null;
+
+  return Object.keys(out).length ? out : null;
+}
+
+// extract both byChatItemId and byItemId
+function extractBillingMaps(billing) {
+  const b = billing && typeof billing === "object" ? billing : null;
+  if (!b) return { byChatItemId: null, byItemId: null };
+
+  const byChatItemId = {};
+  const byItemId = {};
+
+  const arr =
+    (Array.isArray(b.items) && b.items) ||
+    (Array.isArray(b.charges) && b.charges) ||
+    (Array.isArray(b.chatItems) && b.chatItems) ||
+    null;
+
+  if (arr) {
+    for (const row of arr) {
+      const tok = row?.tokens ?? row?.mediaTokens ?? row?.costTokens ?? row?.chargeTokens;
+      const n = Number(tok);
+      if (!Number.isFinite(n) || n <= 0) continue;
+
+      const cid = row?.chatItemId || row?.chat_item_id || row?.cid;
+      const iid = row?.itemId || row?.item_id;
+
+      if (cid) byChatItemId[String(cid)] = n;
+      if (iid) byItemId[String(iid)] = n;
+    }
+  }
+
+  return {
+    byChatItemId: Object.keys(byChatItemId).length ? byChatItemId : null,
+    byItemId: Object.keys(byItemId).length ? byItemId : null,
+  };
+}
+
+function applyBillingMapToThreadItems(threadId, map, setThreadsById, threadsRef) {
+  const tid = String(threadId || "");
+  if (!tid || !map) return;
+
+  setThreadsById((prev) => {
+    const cur = prev || {};
+    const t = cur[tid];
+    if (!t) return prev;
+
+    const items = Array.isArray(t.chatItems) ? t.chatItems : [];
+    if (!items.length) return prev;
+
+    let changed = false;
+
+    const nextItems = items.map((it) => {
+      const cid = String(it?.chatItemId || "");
+      const tok = map[cid];
+      const n = Number(tok);
+
+      if (!cid || !Number.isFinite(n) || n <= 0) return it;
+
+      changed = true;
+      const billing = it?.billing && typeof it.billing === "object" ? it.billing : {};
+
+      return {
+        ...it,
+        billing: { ...billing, transcribeTokens: n, mediaTokens: n },
+        transcribeTokens: n,
+        mediaTokens: n,
+        updatedAt: nowIso(),
+      };
+    });
+
+    if (!changed) return prev;
+
+    const nextThread = { ...t, chatItems: nextItems, updatedAt: nowIso() };
+    const next = { ...cur, [tid]: nextThread };
+    threadsRef.current = next;
+    return next;
+  });
 }
 
 // ---------- file helpers ----------
@@ -317,9 +414,45 @@ async function apiGetThread(jwt, { threadId }) {
   return postJson("/api/threads/get", jwt, { threadId });
 }
 
+// ---------- deterministic optimistic estimation ----------
+function estimateTokensForSecondsDeterministic(seconds, modelId) {
+  const s = Number(seconds || 0);
+  if (!Number.isFinite(s) || s <= 0) return 0;
+
+  if (typeof Billing?.estimateTokensForSeconds === "function") {
+    try {
+      const opts = {
+        quantumSeconds: Billing?.BILLING_QUANTUM_SECONDS,
+        minBillableSeconds: Billing?.MIN_BILLABLE_SECONDS,
+        tokensOverheadPerItem: Billing?.TOKENS_OVERHEAD_PER_ITEM,
+        tokensOverheadPerRun: Billing?.TOKENS_OVERHEAD_PER_RUN,
+      };
+      const n = Billing.estimateTokensForSeconds(s, String(modelId || ""), opts);
+      return Math.max(0, Math.round(Number(n || 0) || 0));
+    } catch {
+      return 0;
+    }
+  }
+
+  return Math.max(0, Math.ceil(s));
+}
+
 export function ThreadsProvider({ children }) {
-  const { user, isAnonymous, getJwt, refreshTokens, applyTokensSnapshot } = useAuth();
-   const { extractAudioToMp3, ensureFfmpeg } = useFfmpeg();
+  const {
+    user,
+    isAnonymous,
+    getJwt,
+    refreshTokens,
+    applyTokensSnapshot,
+    tokenSnapshot,
+
+    // ✅ from your AuthContext (already exists)
+    reserveMediaTokens,
+    releaseMediaTokens,
+    clearAllMediaReservations,
+  } = useAuth();
+
+  const { extractAudioToMp3, ensureFfmpeg } = useFfmpeg();
 
   const [threadsById, setThreadsById] = useState({});
   const [activeId, setActiveIdState] = useState("default");
@@ -392,19 +525,17 @@ export function ThreadsProvider({ children }) {
   };
 
   // =========================
-  // ✅ Token refresh throttling
+  // Token refresh throttling
   // =========================
   const tokenRefreshRef = useRef({ at: 0, inFlight: false });
 
   const refreshTokensThrottled = async () => {
-    // only makes sense for authed users
     if (isAnonymous) return;
     if (typeof refreshTokens !== "function") return;
 
     const now = Date.now();
     const lastAt = Number(tokenRefreshRef.current?.at || 0) || 0;
 
-    // throttle to avoid spamming /api/auth/tokens
     if (tokenRefreshRef.current?.inFlight) return;
     if (now - lastAt < 3500) return;
 
@@ -415,20 +546,45 @@ export function ThreadsProvider({ children }) {
     tokenRefreshRef.current = { at: Date.now(), inFlight: false };
   };
 
-  const clearLiveThread = (threadId) => {
-    setLiveRunsByThread((prev) => {
-      const next = { ...(prev || {}) };
-      delete next[String(threadId)];
-      return next;
-    });
-  };
-
   const patchLiveThread = (threadId, patch) => {
     const tid = String(threadId || "");
     if (!tid) return;
     setLiveRunsByThread((prev) => {
       const cur = (prev && prev[tid]) || {};
       return { ...(prev || {}), [tid]: { ...cur, ...(patch || {}), updatedAt: nowIso() } };
+    });
+  };
+
+  const patchLiveChatItem = (threadId, chatItemId, patch) => {
+    const tid = String(threadId || "");
+    const cid = String(chatItemId || "");
+    if (!tid || !cid) return;
+
+    setLiveRunsByThread((prev) => {
+      const cur = (prev && prev[tid]) || {};
+      const chatItems = cur.chatItems && typeof cur.chatItems === "object" ? cur.chatItems : {};
+      const existing = chatItems[cid] || {};
+      const nextPatch = patch && typeof patch === "object" ? patch : {};
+
+      const existingBilling = existing.billing && typeof existing.billing === "object" ? existing.billing : {};
+      const patchBilling = nextPatch.billing && typeof nextPatch.billing === "object" ? nextPatch.billing : null;
+
+      return {
+        ...(prev || {}),
+        [tid]: {
+          ...cur,
+          chatItems: {
+            ...chatItems,
+            [cid]: {
+              ...existing,
+              ...nextPatch,
+              billing: patchBilling ? { ...existingBilling, ...patchBilling } : existing.billing,
+              updatedAt: nowIso(),
+            },
+          },
+          updatedAt: nowIso(),
+        },
+      };
     });
   };
 
@@ -441,6 +597,171 @@ export function ThreadsProvider({ children }) {
     setWsThreadId(null);
     setWsStatus("disconnected");
     setWsError(null);
+  };
+
+  // =========================
+  // Optimistic reservation bookkeeping
+  // =========================
+  const canReserve =
+    typeof reserveMediaTokens === "function" &&
+    typeof releaseMediaTokens === "function" &&
+    typeof clearAllMediaReservations === "function";
+
+  // key -> amount (mirror of AuthContext, but lets us transfer item->chat)
+  const reservedKeysRef = useRef({});
+
+  const clearAllOptimisticReservations = () => {
+    if (!canReserve) return;
+    clearAllMediaReservations();
+    reservedKeysRef.current = {};
+  };
+
+  const reserveKey = (key, tokens) => {
+    if (!canReserve) return;
+    const k = String(key || "").trim();
+    const n = Math.max(0, Number(tokens || 0) || 0);
+    if (!k || n <= 0) return;
+
+    reservedKeysRef.current[k] = n;
+    reserveMediaTokens(k, n);
+  };
+
+  const releaseKey = (key) => {
+    if (!canReserve) return;
+    const k = String(key || "").trim();
+    if (!k) return;
+
+    releaseMediaTokens(k);
+    const next = { ...(reservedKeysRef.current || {}) };
+    delete next[k];
+    reservedKeysRef.current = next;
+  };
+
+  const getThreadFallbackModelId = (thread) => {
+    return (
+      thread?.draft?.shared?.modelId ||
+      thread?.draft?.shared?.transcribeModelId ||
+      thread?.shared?.modelId ||
+      thread?.runModelId ||
+      null
+    );
+  };
+
+  const estimateForChatItem = (thread, chatItem) => {
+    const seconds = Number(
+      chatItem?.media?.durationSeconds ??
+        chatItem?.media?.duration ??
+        chatItem?.media?.seconds ??
+        chatItem?.local?.durationSeconds ??
+        0
+    );
+
+    if (!Number.isFinite(seconds) || seconds <= 0) return 0;
+
+    const fallbackModelId = getThreadFallbackModelId(thread);
+    const modelId =
+      chatItem?.modelId ||
+      chatItem?.options?.modelId ||
+      chatItem?.status?.transcribe?.modelId ||
+      fallbackModelId ||
+      "";
+
+    // Optional strictness: only estimate if pricingVersion matches server
+    // const clientV = Billing?.PRICING_VERSION ? String(Billing.PRICING_VERSION) : null;
+    // const serverV = tokenSnapshot?.pricingVersion ? String(tokenSnapshot.pricingVersion) : null;
+    // if (clientV && serverV && clientV !== serverV) return 0;
+
+    return estimateTokensForSecondsDeterministic(seconds, modelId);
+  };
+
+  const estimateForDraftItem = (thread, draftFile) => {
+    const seconds = Number(
+      draftFile?.local?.durationSeconds ?? draftFile?.audio?.durationSeconds ?? draftFile?.durationSeconds ?? 0
+    );
+    if (!Number.isFinite(seconds) || seconds <= 0) return 0;
+
+    const fallbackModelId = getThreadFallbackModelId(thread);
+    const modelId = draftFile?.modelId || draftFile?.options?.modelId || fallbackModelId || "";
+    return estimateTokensForSecondsDeterministic(seconds, modelId);
+  };
+
+  const reserveForChatItems = (threadId, chatItemIds) => {
+    if (!canReserve) return;
+
+    const tid = String(threadId || "");
+    const ids = Array.isArray(chatItemIds) ? chatItemIds.map((x) => String(x || "")).filter(Boolean) : [];
+    if (!tid || !ids.length) return;
+
+    const t = (threadsRef.current || {})[tid];
+    const items = ensureChatItemsArray(t?.chatItems);
+
+    for (const cid of ids) {
+      const it = items.find((x) => String(x?.chatItemId || "") === cid);
+      if (!it) continue;
+
+      const est = estimateForChatItem(t, it);
+      if (est > 0) {
+        const key = `${tid}:chat:${cid}`;
+        reserveKey(key, est);
+        patchLiveChatItem(tid, cid, { billing: { potentialTokens: est }, potentialTokens: est });
+      }
+    }
+  };
+
+  const reserveForDraftItemIds = (threadId, itemIds) => {
+    if (!canReserve) return;
+
+    const tid = String(threadId || "");
+    const ids = Array.isArray(itemIds) ? itemIds.map((x) => String(x || "")).filter(Boolean) : [];
+    if (!tid || !ids.length) return;
+
+    const t = (threadsRef.current || {})[tid];
+    if (!t) return;
+
+    const d = ensureDraftShape(t.draft);
+    const files = Array.isArray(d.files) ? d.files : [];
+
+    for (const iid of ids) {
+      const f = files.find((x) => String(x?.itemId || "") === iid);
+      if (!f) continue;
+
+      const est = estimateForDraftItem(t, f);
+      if (est > 0) {
+        const key = `${tid}:item:${iid}`;
+        reserveKey(key, est);
+      }
+    }
+  };
+
+  const transferReservationItemToChat = (threadId, itemId, chatItemId) => {
+    if (!canReserve) return;
+
+    const tid = String(threadId || "");
+    const iid = String(itemId || "");
+    const cid = String(chatItemId || "");
+    if (!tid || !iid || !cid) return;
+
+    const itemKey = `${tid}:item:${iid}`;
+    const n = Number(reservedKeysRef.current?.[itemKey] || 0) || 0;
+    if (n <= 0) return;
+
+    releaseKey(itemKey);
+    const chatKey = `${tid}:chat:${cid}`;
+    reserveKey(chatKey, n);
+    patchLiveChatItem(tid, cid, { billing: { potentialTokens: n }, potentialTokens: n });
+  };
+
+  const releaseForChatItems = (threadId, chatItemIds) => {
+    if (!canReserve) return;
+
+    const tid = String(threadId || "");
+    const ids = Array.isArray(chatItemIds) ? chatItemIds.map((x) => String(x || "")).filter(Boolean) : [];
+    if (!tid || !ids.length) return;
+
+    for (const cid of ids) {
+      releaseKey(`${tid}:chat:${cid}`);
+      patchLiveChatItem(tid, cid, { billing: { potentialTokens: null }, potentialTokens: null });
+    }
   };
 
   const applyThreadSnapshot = async (thread, chatItems) => {
@@ -484,31 +805,9 @@ export function ThreadsProvider({ children }) {
     }
   };
 
-  const patchLiveChatItem = (threadId, chatItemId, patch) => {
-    const tid = String(threadId || "");
-    const cid = String(chatItemId || "");
-    if (!tid || !cid) return;
-
-    setLiveRunsByThread((prev) => {
-      const cur = (prev && prev[tid]) || {};
-      const chatItems = cur.chatItems && typeof cur.chatItems === "object" ? cur.chatItems : {};
-      const existing = chatItems[cid] || {};
-      const nextPatch = patch && typeof patch === "object" ? patch : {};
-
-      return {
-        ...(prev || {}),
-        [tid]: {
-          ...cur,
-          chatItems: {
-            ...chatItems,
-            [cid]: { ...existing, ...nextPatch, updatedAt: nowIso() },
-          },
-          updatedAt: nowIso(),
-        },
-      };
-    });
-  };
-
+  // =========================
+  // WS events
+  // =========================
   const handleWsEvent = async (msg) => {
     const type = String(msg?.type || "");
     const threadId = String(msg?.threadId || "");
@@ -517,8 +816,6 @@ export function ThreadsProvider({ children }) {
       setWsError(null);
       setWsStatus("ready");
 
-      // ✅ Server already sends the live token snapshot in HELLO_OK
-      // payload: { mediaTokens, mediaTokensBalance, mediaTokensReserved, pricingVersion, serverTime, ... }
       try {
         const p = msg?.payload || {};
         if (typeof applyTokensSnapshot === "function") {
@@ -530,10 +827,49 @@ export function ThreadsProvider({ children }) {
             serverTime: p.serverTime || p.ts || null,
           });
         }
+
+        // authoritative => clear optimistic
+        clearAllOptimisticReservations();
       } catch {}
 
-      // also do a throttled API refresh to stay authoritative
-      refreshTokensThrottled().catch(() => {});
+      return;
+    }
+
+    if (type === "TOKENS_UPDATED") {
+      const payload = msg?.payload || {};
+      const rawTok = payload.tokens || payload.tokenSnapshot || null;
+      const billing = payload.billing || null;
+
+      try {
+        const patch = pickTokenPatch(rawTok);
+        if (patch && typeof applyTokensSnapshot === "function") applyTokensSnapshot(patch);
+
+        // authoritative => clear optimistic
+        clearAllOptimisticReservations();
+      } catch {}
+
+      if (billing) {
+        const maps = extractBillingMaps(billing);
+
+        patchLiveThread(threadId, {
+          billing,
+          billingByChatItemId: maps.byChatItemId || null,
+          billingByItemId: maps.byItemId || null,
+        });
+
+        if (maps.byChatItemId) {
+          for (const [cid, tokens] of Object.entries(maps.byChatItemId)) {
+            const n = Number(tokens || 0) || 0;
+            patchLiveChatItem(threadId, cid, {
+              billing: { transcribeTokens: n, mediaTokens: n },
+              transcribeTokens: n,
+              mediaTokens: n,
+            });
+          }
+          applyBillingMapToThreadItems(threadId, maps.byChatItemId, setThreadsById, threadsRef);
+        }
+      }
+
       return;
     }
 
@@ -542,6 +878,38 @@ export function ThreadsProvider({ children }) {
       const message = msg?.payload?.message || "WebSocket error";
       setWsError({ code, message });
       toastWs(code, message);
+
+      // apply authoritative snapshot if any
+      try {
+        const p = msg?.payload || {};
+        const rawTok = p.tokens || p.tokenSnapshot || null;
+        const patch = pickTokenPatch(rawTok);
+        if (patch && typeof applyTokensSnapshot === "function") applyTokensSnapshot(patch);
+
+        clearAllOptimisticReservations();
+
+        if (p.billing) {
+          const maps = extractBillingMaps(p.billing);
+          patchLiveThread(threadId, {
+            billing: p.billing,
+            billingByChatItemId: maps.byChatItemId || null,
+            billingByItemId: maps.byItemId || null,
+          });
+
+          if (maps.byChatItemId) {
+            for (const [cid, tokens] of Object.entries(maps.byChatItemId)) {
+              const n = Number(tokens || 0) || 0;
+              patchLiveChatItem(threadId, cid, {
+                billing: { transcribeTokens: n, mediaTokens: n },
+                transcribeTokens: n,
+                mediaTokens: n,
+              });
+            }
+            applyBillingMapToThreadItems(threadId, maps.byChatItemId, setThreadsById, threadsRef);
+          }
+        }
+      } catch {}
+
       return;
     }
 
@@ -562,17 +930,12 @@ export function ThreadsProvider({ children }) {
       const media = it.media && typeof it.media === "object" ? it.media : {};
 
       const nextItems = [...items];
-      nextItems[idx] = {
-        ...it,
-        media: { ...media, playbackUrl: url },
-        updatedAt: nowIso(),
-      };
+      nextItems[idx] = { ...it, media: { ...media, playbackUrl: url }, updatedAt: nowIso() };
 
       const nextThread = { ...t, chatItems: nextItems, updatedAt: nowIso() };
       const nextThreads = { ...cur, [threadId]: nextThread };
       setThreadsById(nextThreads);
       threadsRef.current = nextThreads;
-
       return;
     }
 
@@ -599,8 +962,28 @@ export function ThreadsProvider({ children }) {
       const runId = String(msg?.payload?.runId || "");
       patchLiveThread(threadId, { lastRunId: runId || null });
 
-      // ✅ token reservations / charges often happen around run start
-      refreshTokensThrottled().catch(() => {});
+      const billing = msg?.payload?.billing || null;
+      if (billing) {
+        const maps = extractBillingMaps(billing);
+        patchLiveThread(threadId, {
+          billing,
+          billingByChatItemId: maps.byChatItemId || null,
+          billingByItemId: maps.byItemId || null,
+        });
+
+        if (maps.byChatItemId) {
+          for (const [cid, tokens] of Object.entries(maps.byChatItemId)) {
+            const n = Number(tokens || 0) || 0;
+            patchLiveChatItem(threadId, cid, {
+              billing: { transcribeTokens: n, mediaTokens: n },
+              transcribeTokens: n,
+              mediaTokens: n,
+            });
+          }
+          applyBillingMapToThreadItems(threadId, maps.byChatItemId, setThreadsById, threadsRef);
+        }
+      }
+
       return;
     }
 
@@ -615,17 +998,13 @@ export function ThreadsProvider({ children }) {
 
       const draftMap = {};
       try {
-        const cur2 = threadsRef.current || {};
-        const tLocal = cur2[threadId];
+        const tLocal = (threadsRef.current || {})[threadId];
         const d = tLocal?.draft && typeof tLocal.draft === "object" ? tLocal.draft : null;
         const files = Array.isArray(d?.files) ? d.files : [];
         for (const f of files) {
           const iid = String(f?.itemId || "");
           if (!iid) continue;
-          draftMap[iid] = {
-            clientFileId: f?.clientFileId || null,
-            local: f?.local || null,
-          };
+          draftMap[iid] = { clientFileId: f?.clientFileId || null, local: f?.local || null };
         }
       } catch {}
 
@@ -637,13 +1016,7 @@ export function ThreadsProvider({ children }) {
         const hit = draftMap[iid];
         if (!hit?.clientFileId) return it;
 
-        return {
-          ...it,
-          media: {
-            ...m,
-            clientFileId: String(hit.clientFileId),
-          },
-        };
+        return { ...it, media: { ...m, clientFileId: String(hit.clientFileId) } };
       });
 
       if (t) {
@@ -665,14 +1038,9 @@ export function ThreadsProvider({ children }) {
       }
 
       for (const it of items) {
-        if (it?.chatItemId) {
-          patchLiveChatItem(threadId, it.chatItemId, { status: it.status || {}, stream: {}, progress: {} });
-        }
+        if (it?.chatItemId) patchLiveChatItem(threadId, it.chatItemId, { status: it.status || {}, stream: {}, progress: {} });
       }
-
       if (runId) patchLiveThread(threadId, { lastRunId: runId });
-      // ✅ often tokens are reserved/charged when items are created
-      refreshTokensThrottled().catch(() => {});
 
       if (scope) {
         try {
@@ -697,6 +1065,39 @@ export function ThreadsProvider({ children }) {
         }
       } catch {}
 
+      // ✅ move itemId reservation -> chatItemId reservation
+      try {
+        for (const it of patchedItems) {
+          const iid = String(it?.itemId || "");
+          const cid = String(it?.chatItemId || "");
+          if (!iid || !cid) continue;
+          transferReservationItemToChat(threadId, iid, cid);
+        }
+      } catch {}
+
+      // ✅ if server billed by itemId first, attach once chatItemId exists
+      try {
+        const liveForThread = liveRunsByThread && liveRunsByThread[String(threadId)] ? liveRunsByThread[String(threadId)] : null;
+        const byItemId = liveForThread?.billingByItemId || null;
+
+        if (byItemId && patchedItems.length) {
+          for (const it2 of patchedItems) {
+            const iid = String(it2?.itemId || "");
+            const cid = String(it2?.chatItemId || "");
+            const n = Number((iid && byItemId[iid]) || 0) || 0;
+            if (!iid || !cid || n <= 0) continue;
+
+            patchLiveChatItem(threadId, cid, {
+              billing: { transcribeTokens: n, mediaTokens: n },
+              transcribeTokens: n,
+              mediaTokens: n,
+            });
+
+            applyBillingMapToThreadItems(threadId, { [cid]: n }, setThreadsById, threadsRef);
+          }
+        }
+      } catch {}
+
       return;
     }
 
@@ -705,7 +1106,6 @@ export function ThreadsProvider({ children }) {
       const step = String(msg?.payload?.step || "transcribe");
       const incoming = Array.isArray(msg?.payload?.segments) ? msg.payload.segments : [];
       const append = !!msg?.payload?.append;
-
       if (!chatItemId) return;
 
       setLiveRunsByThread((prev) => {
@@ -715,7 +1115,6 @@ export function ThreadsProvider({ children }) {
 
         const segObj = existing.segments && typeof existing.segments === "object" ? existing.segments : {};
         const arr = Array.isArray(segObj[step]) ? segObj[step] : [];
-
         const nextArr = append ? [...arr, ...incoming] : [...incoming];
 
         return {
@@ -724,17 +1123,12 @@ export function ThreadsProvider({ children }) {
             ...cur,
             chatItems: {
               ...chatItems,
-              [chatItemId]: {
-                ...existing,
-                segments: { ...segObj, [step]: nextArr },
-                updatedAt: nowIso(),
-              },
+              [chatItemId]: { ...existing, segments: { ...segObj, [step]: nextArr }, updatedAt: nowIso() },
             },
             updatedAt: nowIso(),
           },
         };
       });
-
       return;
     }
 
@@ -767,7 +1161,6 @@ export function ThreadsProvider({ children }) {
           },
         };
       });
-
       return;
     }
 
@@ -800,7 +1193,6 @@ export function ThreadsProvider({ children }) {
           },
         };
       });
-
       return;
     }
 
@@ -815,10 +1207,12 @@ export function ThreadsProvider({ children }) {
           updatedAt: nowIso(),
         };
 
-     // ✅ when transcribe finishes/fails, refresh tokens (deductions typically finalize here)
       try {
         const st = String(patch?.status?.transcribe?.state || "");
-        if (st === "done" || st === "failed") refreshTokensThrottled().catch(() => {});
+        if (st === "done" || st === "failed") {
+          releaseForChatItems(threadId, [chatItemId]);
+          refreshTokensThrottled().catch(() => {});
+        }
       } catch {}
 
       const cur = threadsRef.current || {};
@@ -836,11 +1230,9 @@ export function ThreadsProvider({ children }) {
       const nextThreads = { ...cur, [threadId]: nextThread };
       setThreadsById(nextThreads);
       threadsRef.current = nextThreads;
-
       return;
     }
 
-    // (Optional) handle completion if you ever emit it server-side
     if (type === "RUN_COMPLETED") {
       refreshTokensThrottled().catch(() => {});
       return;
@@ -850,7 +1242,14 @@ export function ThreadsProvider({ children }) {
       const message = String(msg?.payload?.message || "Run failed");
       toast.error(message);
 
-     // ✅ refresh in case reserved tokens were released or a charge was reverted
+      // release optimistic for this thread
+      try {
+        const tid = String(threadId || "");
+        const liveT = threadsRef.current?.[tid];
+        const ids = ensureChatItemsArray(liveT?.chatItems).map((x) => String(x?.chatItemId || "")).filter(Boolean);
+        releaseForChatItems(tid, ids);
+      } catch {}
+
       refreshTokensThrottled().catch(() => {});
 
       try {
@@ -868,9 +1267,7 @@ export function ThreadsProvider({ children }) {
     const tid = String(threadId || "");
     if (!tid || tid === "default") return;
 
-    if (wsBoundThreadRef.current && String(wsBoundThreadRef.current) !== tid) {
-      disconnectWs();
-    }
+    if (wsBoundThreadRef.current && String(wsBoundThreadRef.current) !== tid) disconnectWs();
 
     if (wsClientRef.current && wsBoundThreadRef.current === tid) {
       try {
@@ -899,9 +1296,8 @@ export function ThreadsProvider({ children }) {
       onStatus: (s) => {
         const st = String(s?.status || "");
         setWsStatus(st || "disconnected");
-        // ws client emits "socket_open" and "ready"
         if (st === "ready" || st === "socket_open" || st === "connecting") setWsError(null);
-       },
+      },
       onEvent: (msg) => {
         handleWsEvent(msg).catch(() => {});
       },
@@ -932,7 +1328,6 @@ export function ThreadsProvider({ children }) {
     const cid = String(chatItemId || "");
     if (!tid || !cid) return false;
     if (!wsClientRef.current || !wsClientRef.current.isConnected()) return false;
-
     return wsClientRef.current.send("GET_MEDIA_URL", { threadId: tid, chatItemId: cid });
   };
 
@@ -942,145 +1337,7 @@ export function ThreadsProvider({ children }) {
     return wsClientRef.current.send("GET_THREAD_SNAPSHOT", { threadId: tid, includeChatItems: true });
   };
 
-  const clearTranscribeFieldsOnThread = (threadId, chatItemId) => {
-    const tid = String(threadId || "");
-    const cid = String(chatItemId || "");
-    if (!tid || !cid) return;
-
-    const cur = threadsRef.current || {};
-    const t = cur[tid];
-    if (!t) return;
-
-    const items = ensureChatItemsArray(t.chatItems);
-    const idx = items.findIndex((x) => String(x?.chatItemId || "") === cid);
-    if (idx < 0) return;
-
-    const it = items[idx] || {};
-    const status = it.status || {};
-    const results = it.results || {};
-
-    const nextItems = [...items];
-    nextItems[idx] = {
-      ...it,
-      status: {
-        ...status,
-        transcribe: {
-          ...(status.transcribe || {}),
-          state: "queued",
-          stage: "queued",
-          queuedAt: nowIso(),
-          updatedAt: nowIso(),
-          error: null,
-        },
-      },
-      results: {
-        ...results,
-        transcript: "",
-        transcriptText: "",
-        transcriptSrt: "",
-        transcriptSegments: [],
-        transcriptMeta: { ...(results.transcriptMeta || {}), clearedAt: nowIso() },
-      },
-      updatedAt: nowIso(),
-    };
-
-    const nextThread = { ...t, chatItems: nextItems, updatedAt: nowIso() };
-    const nextThreads = { ...cur, [tid]: nextThread };
-
-    setThreadsById(nextThreads);
-    threadsRef.current = nextThreads;
-
-    if (String(activeRef.current) === tid) {
-      persist(nextThreads, activeRef.current, syncRef.current).catch(() => {});
-    }
-  };
-
-  const retryTranscribe = async ({ chatItemIds, chatItemId, options } = {}) => {
-    const tid = wsBoundThreadRef.current || activeRef.current;
-    if (!tid || tid === "default") {
-      toast.error("No thread selected.");
-      return false;
-    }
-
-    if (!wsClientRef.current || !wsClientRef.current.isConnected()) {
-      toast.error("Not connected to the realtime server yet.");
-      return false;
-    }
-
-    const ids =
-      Array.isArray(chatItemIds) && chatItemIds.length
-        ? chatItemIds.map((x) => String(x || "")).filter(Boolean)
-        : chatItemId
-        ? [String(chatItemId)]
-        : [];
-
-    if (!ids.length) {
-      toast.error("No chatItemId(s) provided.");
-      return false;
-    }
-
-    const payload = {
-      threadId: String(tid),
-      chatItemIds: ids,
-      options: options && typeof options === "object" ? options : {},
-    };
-
-    const wantClear = !!(payload.options && payload.options.clear);
-
-    if (wantClear) {
-      for (const cid of ids) {
-        patchLiveChatItem(tid, cid, {
-          stream: { transcribe: [] },
-          progress: { transcribe: 0 },
-          segments: { transcribe: [] },
-          updatedAt: nowIso(),
-        });
-
-        clearTranscribeFieldsOnThread(tid, cid);
-      }
-    }
-
-    const ok = wsClientRef.current.send("RETRY_TRANSCRIBE", payload);
-    if (!ok) toast.error("Failed to send RETRY_TRANSCRIBE");
-    return ok;
-  };
-
-  const startRun = async ({ itemIds, itemId, options } = {}) => {
-    const tid = wsBoundThreadRef.current || activeRef.current;
-    if (!tid || tid === "default") {
-      toast.error("No thread selected.");
-      return false;
-    }
-
-    if (!wsClientRef.current || !wsClientRef.current.isConnected()) {
-      toast.error("Not connected to the realtime server yet.");
-      return false;
-    }
-
-    const ids =
-      Array.isArray(itemIds) && itemIds.length
-        ? itemIds.map((x) => String(x || "")).filter(Boolean)
-        : itemId
-        ? [String(itemId)]
-        : [];
-
-    if (!ids.length) {
-      toast.error("No itemIds provided.");
-      return false;
-    }
-
-    const payload = {
-      threadId: String(tid),
-      itemIds: ids,
-      options: options && typeof options === "object" ? options : {},
-    };
-
-    const ok = wsClientRef.current.send("START_RUN", payload);
-    if (!ok) toast.error("Failed to send START_RUN");
-    return ok;
-  };
-
-  // --------- SYNC LOGIC ----------
+  // --------- BOOT ---------
   const syncFromServer = async ({ reason } = {}) => {
     if (isAnonymous) return;
     const jwt = await getJwtIfAny();
@@ -1158,7 +1415,6 @@ export function ThreadsProvider({ children }) {
     await commit(nextThreads, activeRef.current, nextSync);
   };
 
-  // --------- BOOT ---------
   useEffect(() => {
     if (!scope) return;
     if (bootedRef.current && bootedRef.current === scope) return;
@@ -1197,7 +1453,6 @@ export function ThreadsProvider({ children }) {
       disconnectWs();
       return;
     }
-
     connectWsForThread(tid).catch(() => {});
     return () => {};
   }, [activeId]);
@@ -1313,7 +1568,7 @@ export function ThreadsProvider({ children }) {
     );
   };
 
-  // ---------------- Draft Media (UPLOAD -> CONVERT -> UPLOAD MP3) ----------------
+  // ---------------- Draft Media (UPLOAD / URL / DELETE) ----------------
   const addDraftMediaFromFile = async (threadId, file) => {
     if (!threadId || threadId === "default") return;
     if (!file) return;
@@ -1339,7 +1594,6 @@ export function ThreadsProvider({ children }) {
       mime: originalMime,
       lastModified: file?.lastModified || 0,
       isVideo: originalIsVideo,
-      // durationSeconds will be filled later once mp3File exists (FIX)
     };
 
     if (scope) {
@@ -1353,7 +1607,6 @@ export function ThreadsProvider({ children }) {
         bytes: Number(file?.size || 0) || 0,
         savedAt: nowIso(),
       });
-
     }
 
     const draft = ensureDraftShape(t.draft);
@@ -1381,7 +1634,6 @@ export function ThreadsProvider({ children }) {
     return toast.promise(
       (async () => {
         const jwt = await getJwtIfAny();
-
         let mp3File = file;
 
         if (!isMp3(file)) {
@@ -1407,7 +1659,6 @@ export function ThreadsProvider({ children }) {
           }
         }
 
-        // ✅ FIX: probe duration only AFTER mp3File exists
         try {
           const dur = await probeDurationSecondsFromFile(mp3File);
           if (dur != null) localMeta.durationSeconds = dur;
@@ -1432,27 +1683,17 @@ export function ThreadsProvider({ children }) {
         const idx2 = files2.findIndex((x) => String(x?.itemId) === String(itemId));
         if (idx2 >= 0) {
           const prev = files2[idx2] || {};
-          const srv = (r && r.draftFile) ? r.draftFile : {};
-
-          // IMPORTANT: never overwrite these (they point to original local file)
-          const keepClientFileId = prev.clientFileId;
-          const keepLocal = prev.local;
+          const srv = r && r.draftFile ? r.draftFile : {};
 
           files2[idx2] = {
             ...prev,
             ...srv,
-
-            // preserve original upload identity/meta
-            clientFileId: keepClientFileId,
-            local: keepLocal,
-
-            // if server has extra audio/mp3 fields, merge them separately (optional)
+            clientFileId: prev.clientFileId,
+            local: prev.local,
             audio: { ...(prev.audio || {}), ...(srv.audio || {}) },
-
-            stage: (srv && srv.stage) ? srv.stage : "uploaded",
+            stage: srv && srv.stage ? srv.stage : "uploaded",
             updatedAt: nowIso(),
           };
-
         }
 
         const nextT2 = {
@@ -1512,7 +1753,6 @@ export function ThreadsProvider({ children }) {
 
     const draft = ensureDraftShape(t.draft);
 
-    // ✅ FIX: don't reference "dur" before it's declared; keep optimistic urlMeta empty
     const optimistic = {
       itemId,
       clientFileId,
@@ -1539,7 +1779,6 @@ export function ThreadsProvider({ children }) {
       (async () => {
         const jwt = await getJwtIfAny();
 
-        // ✅ FIX: probe inside the promise, then build urlMeta safely
         let dur = null;
         try {
           dur = await probeDurationSecondsFromUrl(clean);
@@ -1676,6 +1915,147 @@ export function ThreadsProvider({ children }) {
     };
     const ok = wsClientRef.current.send("SAVE_SRT", payload);
     if (!ok) toast.error("Failed to send SAVE_SRT");
+    return ok;
+  };
+
+  // --------- START / RETRY ----------
+  const clearTranscribeFieldsOnThread = (threadId, chatItemId) => {
+    const tid = String(threadId || "");
+    const cid = String(chatItemId || "");
+    if (!tid || !cid) return;
+
+    const cur = threadsRef.current || {};
+    const t = cur[tid];
+    if (!t) return;
+
+    const items = ensureChatItemsArray(t.chatItems);
+    const idx = items.findIndex((x) => String(x?.chatItemId || "") === cid);
+    if (idx < 0) return;
+
+    const it = items[idx] || {};
+    const status = it.status || {};
+    const results = it.results || {};
+
+    const nextItems = [...items];
+    nextItems[idx] = {
+      ...it,
+      status: {
+        ...status,
+        transcribe: {
+          ...(status.transcribe || {}),
+          state: "queued",
+          stage: "queued",
+          queuedAt: nowIso(),
+          updatedAt: nowIso(),
+          error: null,
+        },
+      },
+      results: {
+        ...results,
+        transcript: "",
+        transcriptText: "",
+        transcriptSrt: "",
+        transcriptSegments: [],
+        transcriptMeta: { ...(results.transcriptMeta || {}), clearedAt: nowIso() },
+      },
+      updatedAt: nowIso(),
+      transcribeTokens: null,
+      mediaTokens: null,
+    };
+
+    const nextThread = { ...t, chatItems: nextItems, updatedAt: nowIso() };
+    const nextThreads = { ...cur, [tid]: nextThread };
+
+    setThreadsById(nextThreads);
+    threadsRef.current = nextThreads;
+
+    if (String(activeRef.current) === tid) persist(nextThreads, activeRef.current, syncRef.current).catch(() => {});
+  };
+
+  const retryTranscribe = async ({ chatItemIds, chatItemId, options } = {}) => {
+    const tid = wsBoundThreadRef.current || activeRef.current;
+    if (!tid || tid === "default") {
+      toast.error("No thread selected.");
+      return false;
+    }
+    if (!wsClientRef.current || !wsClientRef.current.isConnected()) {
+      toast.error("Not connected to the realtime server yet.");
+      return false;
+    }
+
+    const ids =
+      Array.isArray(chatItemIds) && chatItemIds.length
+        ? chatItemIds.map((x) => String(x || "")).filter(Boolean)
+        : chatItemId
+        ? [String(chatItemId)]
+        : [];
+
+    if (!ids.length) {
+      toast.error("No chatItemId(s) provided.");
+      return false;
+    }
+
+    const payload = {
+      threadId: String(tid),
+      chatItemIds: ids,
+      options: options && typeof options === "object" ? options : {},
+    };
+
+    const wantClear = !!(payload.options && payload.options.clear);
+    if (wantClear) {
+      for (const cid of ids) {
+        patchLiveChatItem(tid, cid, {
+          stream: { transcribe: [] },
+          progress: { transcribe: 0 },
+          segments: { transcribe: [] },
+          updatedAt: nowIso(),
+        });
+        clearTranscribeFieldsOnThread(tid, cid);
+      }
+    }
+
+    // ✅ optimistic reserve immediately
+    reserveForChatItems(tid, ids);
+
+    const ok = wsClientRef.current.send("RETRY_TRANSCRIBE", payload);
+    if (!ok) toast.error("Failed to send RETRY_TRANSCRIBE");
+    return ok;
+  };
+
+  const startRun = async ({ itemIds, itemId, options } = {}) => {
+    const tid = wsBoundThreadRef.current || activeRef.current;
+    if (!tid || tid === "default") {
+      toast.error("No thread selected.");
+      return false;
+    }
+    if (!wsClientRef.current || !wsClientRef.current.isConnected()) {
+      toast.error("Not connected to the realtime server yet.");
+      return false;
+    }
+
+    const ids =
+      Array.isArray(itemIds) && itemIds.length
+        ? itemIds.map((x) => String(x || "")).filter(Boolean)
+        : itemId
+        ? [String(itemId)]
+        : [];
+
+    if (!ids.length) {
+      toast.error("No itemIds provided.");
+      return false;
+    }
+
+    // ✅ optimistic reserve by itemId (draft files). Will transfer on CHAT_ITEMS_CREATED.
+    reserveForDraftItemIds(tid, ids);
+
+    const payload = {
+      threadId: String(tid),
+      itemIds: ids,
+      options: options && typeof options === "object" ? options : {},
+    };
+
+    const ok = wsClientRef.current.send("START_RUN", payload);
+    if (!ok) toast.error("Failed to send START_RUN");
     return ok;
   };
 

@@ -5,14 +5,12 @@ function firstAlphaNumChar(str) {
   if (!str) return "";
   for (let i = 0; i < str.length; i++) {
     const ch = str[i];
-    // keep letters/numbers only
     if (/[A-Za-z0-9]/.test(ch)) return ch;
   }
   return "";
 }
 
 function cleanWord(word) {
-  // remove leading/trailing non-alphanumerics, keep inner chars (e.g. "Raza," -> "Raza")
   return String(word || "")
     .trim()
     .replace(/^[^A-Za-z0-9]+/, "")
@@ -22,20 +20,16 @@ function cleanWord(word) {
 function getInitials(user) {
   const name = (user?.name || "").trim();
   const email = (user?.email || "").trim();
-
   const source = name || email || "User";
 
-  // split on whitespace, clean each word, keep ones that still have an alphanumeric char
   const words = source
     .split(/\s+/)
     .map(cleanWord)
     .filter((w) => firstAlphaNumChar(w));
 
-  // fallback
   if (words.length === 0) return "US";
 
   if (words.length === 1) {
-    // take first two alphanumeric chars from the single word
     const w = words[0];
     const chars = [];
     for (let i = 0; i < w.length; i++) {
@@ -55,23 +49,26 @@ export default function UserBadge({
   user,
   isAnonymous,
   mediaTokens,
+  pendingMediaTokens,
   onGoogleLogin,
   onLogout,
 }) {
   const avatarUrl = user?.prefs?.avatarUrl || "";
   const initials = getInitials(user);
 
-  const displayName = isAnonymous ? "Guest" : (user?.name?.trim() || "User");
+  const displayName = isAnonymous ? "Guest" : user?.name?.trim() || "User";
   const providerBadge = isAnonymous ? "free" : "google";
+
+  const pending = Math.max(0, Number(pendingMediaTokens || 0) || 0);
+  const available = Math.max(0, Number(mediaTokens || 0) || 0);
+
+  // show total as main value (unused + in-use)
+  const total = available + pending;
 
   return (
     <Wrap>
       <AvatarWrap>
-        {avatarUrl ? (
-          <AvatarImg src={avatarUrl} alt={displayName} />
-        ) : (
-          <AvatarFallback aria-hidden="true">{initials}</AvatarFallback>
-        )}
+        {avatarUrl ? <AvatarImg src={avatarUrl} alt={displayName} /> : <AvatarFallback aria-hidden="true">{initials}</AvatarFallback>}
       </AvatarWrap>
 
       <Meta>
@@ -80,8 +77,19 @@ export default function UserBadge({
           <Pill>{providerBadge}</Pill>
         </TopRow>
 
-        <TokenRow>
-          Media Tokens: <b>{mediaTokens}</b>
+        <TokenRow
+          title={
+            pending > 0
+              ? `Media tokens: ${total} (${available} unused, ${pending} in use)`
+              : `Media tokens: ${total} (${available} unused)`
+          }
+        >
+          Media Tokens: <b>{total}</b>
+
+          <Breakdown>
+            <span>{available} unused</span>
+            {pending > 0 ? <Pending>+{pending} in use</Pending> : null}
+          </Breakdown>
         </TokenRow>
 
         <Actions>
@@ -101,13 +109,20 @@ export default function UserBadge({
 }
 
 const Wrap = styled.div`
+  width: 100%;
+  box-sizing: border-box;
+
   display: flex;
   align-items: flex-start;
+  justify-content: flex-start;
   gap: 10px;
+
   padding: 10px;
   border-radius: 14px;
-  background: rgba(0,0,0,0.03);
+  background: rgba(0, 0, 0, 0.03);
   border: 1px solid var(--border);
+
+  min-width: 0;
 `;
 
 const AvatarWrap = styled.div`
@@ -118,13 +133,14 @@ const AvatarWrap = styled.div`
   display: grid;
   place-items: center;
   flex: 0 0 auto;
-  background: rgba(0,0,0,0.08);
+  background: rgba(0, 0, 0, 0.08);
 `;
 
 const AvatarImg = styled.img`
   width: 100%;
   height: 100%;
   object-fit: cover;
+  display: block;
 `;
 
 const AvatarFallback = styled.div`
@@ -134,7 +150,9 @@ const AvatarFallback = styled.div`
 `;
 
 const Meta = styled.div`
+  flex: 1 1 auto;
   min-width: 0;
+
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -161,8 +179,8 @@ const Pill = styled.span`
   font-size: 11px;
   padding: 2px 8px;
   border-radius: 999px;
-  border: 1px solid rgba(239,68,68,0.25);
-  background: rgba(239,68,68,0.08);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  background: rgba(239, 68, 68, 0.08);
   color: var(--accent);
   font-weight: 800;
   flex: 0 0 auto;
@@ -171,10 +189,26 @@ const Pill = styled.span`
 const TokenRow = styled.div`
   font-size: 12px;
   color: var(--muted);
+  line-height: 1.25;
 
   b {
     color: var(--text);
+    font-weight: 950;
   }
+`;
+
+const Breakdown = styled.div`
+  margin-top: 2px;
+  display: flex;
+  gap: 10px;
+  font-size: 11px;
+  font-weight: 800;
+  color: var(--muted);
+`;
+
+const Pending = styled.span`
+  font-weight: 950;
+  color: rgba(59, 130, 246, 1);
 `;
 
 const Actions = styled.div`
@@ -186,8 +220,8 @@ const Actions = styled.div`
 
 const PrimaryButton = styled.button`
   width: 100%;
-  border: 1px solid rgba(239,68,68,0.25);
-  background: rgba(239,68,68,0.08);
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  background: rgba(239, 68, 68, 0.08);
   color: var(--accent);
   font-weight: 800;
   border-radius: 12px;
@@ -195,7 +229,7 @@ const PrimaryButton = styled.button`
   cursor: pointer;
 
   &:hover {
-    background: rgba(239,68,68,0.12);
+    background: rgba(239, 68, 68, 0.12);
   }
 `;
 
