@@ -4,6 +4,7 @@ import styled from "styled-components";
 import Sidebar from "./Sidebar";
 import ThreadView from "./ThreadView";
 import { useThreads } from "../contexts/threadsContext";
+import { Toaster } from "sonner";
 
 export default function AppShell({
   user,
@@ -16,11 +17,12 @@ export default function AppShell({
   onGoogleLogin,
   onLogout,
 }) {
-  const { threads, activeId, setActiveId, activeThread, loadingThreads, createThread } = useThreads();
+  const { threads, activeId, setActiveId, activeThread, loadingThreads, createThread, creatingThread } = useThreads();
   const [collapsed, setCollapsed] = useState(false);
 
   return (
     <Shell>
+      <Toaster position="bottom-right" richColors/>
       <Sidebar
         collapsed={collapsed}
         onToggle={() => setCollapsed((v) => !v)}
@@ -28,6 +30,7 @@ export default function AppShell({
         activeId={activeId}
         onSelect={setActiveId}
         onCreateThread={createThread}
+        creatingThread={creatingThread}
         user={user}
         isAnonymous={isAnonymous}
         mediaTokens={mediaTokens}

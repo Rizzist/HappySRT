@@ -9,6 +9,7 @@ export default function Sidebar({
   activeId,
   onSelect,
   onCreateThread,
+  creatingThread,
   user,
   isAnonymous,
 
@@ -105,9 +106,15 @@ export default function Sidebar({
 
       {!collapsed && (
         <>
-          <NewThreadButton type="button" onClick={onCreateThread}>
-            + New thread
-          </NewThreadButton>
+<NewThreadButton
+  type="button"
+  onClick={onCreateThread}
+  disabled={!!creatingThread}
+  title={creatingThread ? "Creating…" : "Create a new thread"}
+>
+  {creatingThread ? "Creating…" : "+ New thread"}
+</NewThreadButton>
+
 
           <NavLabel>Threads</NavLabel>
 
@@ -279,6 +286,11 @@ const NewThreadButton = styled.button`
 
   &:hover {
     background: rgba(239, 68, 68, 0.12);
+  }
+
+    &:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 `;
 

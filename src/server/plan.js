@@ -15,6 +15,6 @@ export function getUserPlan(appwriteUser) {
 
 export function getThreadLimitForPlan(plan) {
   if (plan === "paid") return 100;
-  if (plan === "free") return 2;
+  if (plan === "free") return 3;
   return 1; // guest
 }

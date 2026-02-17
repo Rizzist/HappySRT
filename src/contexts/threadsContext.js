@@ -9,9 +9,17 @@ import { putLocalMedia, deleteLocalMedia } from "../lib/mediaStore";
 import { createThreadWsClient } from "../lib/wsThreadsClient";
 import { putMediaIndex, getMediaIndex } from "../lib/mediaIndexStore";
 import { putLocalMediaMeta } from "../lib/mediaMetaStore";
+import { safeLangKey, deleteLangKey } from "../lib/langKey";
 
 import * as BillingImport from "../shared/billingCatalog";
+import * as TranslationImport from "../shared/translationCatalog";
+import * as TranslationBillingImport from "../shared/translationBillingCatalog";
+const TranslationCatalog = (TranslationImport && (TranslationImport.default || TranslationImport)) || {};
+const TR_DEFAULTS = TranslationCatalog?.DEFAULTS || {};
+
 const Billing = (BillingImport && (BillingImport.default || BillingImport)) || {};
+const TranslationBilling =
+  (TranslationBillingImport && (TranslationBillingImport.default || TranslationBillingImport)) || {};
 
 const ThreadsContext = createContext(null);
 
@@ -144,16 +152,67 @@ function mergeChatItems(prev, incoming) {
   return out;
 }
 
+function mergeObj(a, b) {
+  const A = a && typeof a === "object" && !Array.isArray(a) ? a : null;
+  const B = b && typeof b === "object" && !Array.isArray(b) ? b : null;
+  if (A && B) return { ...A, ...B };
+  return b != null ? b : a;
+}
+
+function mergeLangMap(prevMap, patchMap) {
+  const A = prevMap && typeof prevMap === "object" && !Array.isArray(prevMap) ? prevMap : {};
+  const B = patchMap && typeof patchMap === "object" && !Array.isArray(patchMap) ? patchMap : null;
+  if (!B) return prevMap || null;
+  return { ...A, ...B };
+}
+
 function applyChatItemPatch(item, patch) {
   const p = patch && typeof patch === "object" ? patch : {};
+
+  const prevStatus = item?.status && typeof item.status === "object" ? item.status : {};
+  const prevResults = item?.results && typeof item.results === "object" ? item.results : {};
+
+  // base shallow merge
+  let nextStatus = p.status ? { ...prevStatus, ...(p.status || {}) } : prevStatus;
+  let nextResults = p.results ? { ...prevResults, ...(p.results || {}) } : prevResults;
+
+  // deep merge known step objects to avoid clobbering fields
+  if (p.status && typeof p.status === "object") {
+    for (const k of ["transcribe", "translate", "summarize"]) {
+      if (p.status[k] && typeof p.status[k] === "object") {
+        nextStatus[k] = mergeObj(prevStatus[k], p.status[k]);
+      }
+    }
+
+    // translate.byLang (per target)
+    if (p.status.translate && typeof p.status.translate === "object") {
+      const prevByLang = prevStatus?.translate?.byLang;
+      const patchByLang = p.status?.translate?.byLang;
+      const mergedByLang = mergeLangMap(prevByLang, patchByLang);
+      if (mergedByLang) {
+        nextStatus.translate = nextStatus.translate || {};
+        nextStatus.translate.byLang = mergedByLang;
+      }
+    }
+  }
+
+  // deep merge translations map (results.translations[lang])
+  if (p.results && typeof p.results === "object") {
+    const prevTranslations = prevResults?.translations;
+    const patchTranslations = p.results?.translations;
+    const mergedTranslations = mergeLangMap(prevTranslations, patchTranslations);
+    if (mergedTranslations) nextResults.translations = mergedTranslations;
+  }
+
   return {
     ...(item || {}),
     ...(p || {}),
-    status: p.status ? { ...(item?.status || {}), ...(p.status || {}) } : item?.status || {},
-    results: p.results ? { ...(item?.results || {}), ...(p.results || {}) } : item?.results || {},
+    status: nextStatus || {},
+    results: nextResults || {},
     updatedAt: p.updatedAt || item?.updatedAt || nowIso(),
   };
 }
+
 
 function hasOwn(obj, key) {
   return Object.prototype.hasOwnProperty.call(obj || {}, key);
@@ -437,6 +496,270 @@ function estimateTokensForSecondsDeterministic(seconds, modelId) {
   return Math.max(0, Math.ceil(s));
 }
 
+function uniqStrings(arr) {
+  const out = [];
+  const seen = new Set();
+  for (const x of Array.isArray(arr) ? arr : []) {
+    const s = String(x || "").trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+function normalizeRunOptions(raw) {
+  const o = raw && typeof raw === "object" ? { ...raw } : {};
+
+  // strip any legacy translation fields (no backwards compatibility)
+  delete o.trProvider;
+  delete o.trModel;
+  delete o.trSourceLang;
+  delete o.trLang;
+  delete o.trTargetLangs;
+  delete o.trLangs;
+
+  // If translation block exists, normalize it (array-only)
+  if (o.translation && typeof o.translation === "object") {
+    const t = o.translation || {};
+
+    const modelId = String(t.modelId || TR_DEFAULTS?.modelId || "gpt-4o-mini");
+    const modelObj = typeof TranslationCatalog?.getModelById === "function" ? TranslationCatalog.getModelById(modelId) : null;
+
+    const sourceLang = String(t.sourceLang || TR_DEFAULTS?.sourceLang || "auto");
+
+    const fallbackTargets =
+      (Array.isArray(TR_DEFAULTS?.targetLangs) && TR_DEFAULTS.targetLangs.length ? TR_DEFAULTS.targetLangs : ["en"]);
+
+const targetLangs = uniqStrings(
+  (Array.isArray(t.targetLangs) && t.targetLangs.length ? t.targetLangs : fallbackTargets)
+    .map((x) => safeLangKey(x))
+    .filter(Boolean)
+);
+
+    o.translation = {
+      enabled: !!t.enabled,
+      provider: t.provider != null ? String(t.provider) : (modelObj?.provider || "openai"),
+      modelId: String(modelObj?.id || modelId),
+      sourceLang,
+      targetLangs, // ✅ always array
+    };
+
+    return o;
+  }
+
+  // If caller set doTranslate but forgot translation block, enforce catalog defaults.
+  if (o.doTranslate) {
+    const fallbackTargets =
+      (Array.isArray(TR_DEFAULTS?.targetLangs) && TR_DEFAULTS.targetLangs.length ? TR_DEFAULTS.targetLangs : ["en"]);
+
+    const modelId = String(TR_DEFAULTS?.modelId || "gpt-4o-mini");
+    const modelObj = typeof TranslationCatalog?.getModelById === "function" ? TranslationCatalog.getModelById(modelId) : null;
+
+    o.translation = {
+      enabled: true,
+      provider: modelObj?.provider || "openai",
+      modelId: String(modelObj?.id || modelId),
+      sourceLang: String(TR_DEFAULTS?.sourceLang || "auto"),
+      targetLangs: uniqStrings(fallbackTargets),
+    };
+  }
+
+  return o;
+}
+
+
+// =========================
+// ✅ Translation optimistic reserve helpers
+// =========================
+function getTranscriptSegmentsAny(chatItem) {
+  const r = chatItem?.results && typeof chatItem.results === "object" ? chatItem.results : {};
+  const a = Array.isArray(r.transcriptSegments) ? r.transcriptSegments : [];
+  if (a.length) return a;
+  const b = Array.isArray(r.transcriptSegmentsOriginal) ? r.transcriptSegmentsOriginal : [];
+  if (b.length) return b;
+  return [];
+}
+
+function estimateTranslationUnitTokensDeterministic({ segments, seconds, modelId, estimateOpts } = {}) {
+  const segs = Array.isArray(segments) ? segments : [];
+  const dur = Number(seconds || 0) || 0;
+
+  // Prefer shared estimator if present (matches server logic closely)
+  if (typeof TranslationBilling?.estimateTranslationRunWithDurationFallback === "function") {
+    try {
+      const opts = estimateOpts && typeof estimateOpts === "object" ? { ...estimateOpts } : {};
+      if (modelId && !opts.modelId) opts.modelId = String(modelId);
+
+      // ✅ unit estimate: pass ONE lang so output is "per-lang"
+      const est = TranslationBilling.estimateTranslationRunWithDurationFallback(
+        segs.length ? { segments: segs } : null,
+        dur,
+        ["en"],
+        opts
+      );
+
+      const n = Number(est?.mediaTokens || 0) || 0;
+      return Math.max(1, Math.round(n));
+    } catch {}
+  }
+
+  // Fallback heuristic: chars/4 + small overhead, duration fallback if no segs
+  const charCount = segs.reduce((a, s) => a + String(s?.text || "").length, 0);
+  if (charCount > 0) return Math.max(1, Math.ceil(charCount / 4) + 25);
+  if (dur > 0) return Math.max(1, Math.ceil(dur)); // very rough
+  return 0;
+}
+
+function translateKey(threadId, chatItemId, lang) {
+  return `${String(threadId)}:chat:${String(chatItemId)}:tr:${safeLangKey(lang)}`;
+}
+
+function unionLangs(a, b) {
+  const out = [];
+  const seen = new Set();
+  for (const x of Array.isArray(a) ? a : []) {
+    const k = safeLangKey(x);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+  }
+  for (const x of Array.isArray(b) ? b : []) {
+    const k = safeLangKey(x);
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+  }
+  return out;
+}
+
+function langsToQueueFromStatus(chatItem, targetLangs, force) {
+  const langs = Array.isArray(targetLangs) ? targetLangs.map(safeLangKey).filter(Boolean) : [];
+  if (!langs.length) return [];
+  if (force) return langs;
+
+  const st = chatItem?.status && typeof chatItem.status === "object" ? chatItem.status : {};
+  const tr = st?.translate && typeof st.translate === "object" ? st.translate : {};
+  const byLang = tr?.byLang && typeof tr.byLang === "object" ? tr.byLang : {};
+
+  const out = [];
+  for (const l of langs) {
+    const cur = String(byLang?.[l]?.state || "");
+    if (cur === "done") continue;
+    if (cur === "queued" || cur === "running") continue;
+    out.push(l);
+  }
+  return out;
+}
+
+function setTranslateQueuedOnThread({
+  threadId,
+  chatItemId,
+  langsQueued,
+  unitTokens,
+  modelId,
+  sourceLang,
+  allTargetLangs,
+  clearTranslate,
+  setThreadsById,
+  threadsRef,
+  persist,
+  activeRef,
+  syncRef,
+ scope,
+} = {}) {
+  const tid = String(threadId || "");
+  const cid = String(chatItemId || "");
+  const langs = Array.isArray(langsQueued) ? langsQueued.map(safeLangKey).filter(Boolean) : [];
+  if (!tid || !cid || !langs.length) return;
+
+  const cur = threadsRef.current || {};
+  const t = cur[tid];
+  if (!t) return;
+
+  const items = ensureChatItemsArray(t.chatItems);
+  const idx = items.findIndex((x) => String(x?.chatItemId || "") === cid);
+  if (idx < 0) return;
+
+  const it = items[idx] || {};
+  const status = it.status || {};
+  const results = it.results || {};
+
+  const prevTr = status.translate && typeof status.translate === "object" ? status.translate : {};
+  const prevByLang = prevTr.byLang && typeof prevTr.byLang === "object" ? prevTr.byLang : {};
+
+  const now = nowIso();
+
+  const nextByLang = { ...prevByLang };
+  for (const l of langs) {
+    const prev = nextByLang[l] && typeof nextByLang[l] === "object" ? nextByLang[l] : {};
+    nextByLang[l] = {
+      ...prev,
+      state: "queued",
+      progress: 0,
+      targetLang: l,
+      modelId: modelId || prev.modelId || null,
+      sourceLang: sourceLang || prev.sourceLang || null,
+      queuedAt: now,
+      startedAt: null,
+      finishedAt: null,
+      error: null,
+      // ✅ show "reserved" on the item (like transcribe potentialTokens)
+      potentialTokens: unitTokens > 0 ? unitTokens : undefined,
+      estimatedTokens: unitTokens > 0 ? unitTokens : undefined,
+    };
+  }
+
+  const mergedTargets = unionLangs(allTargetLangs || prevTr.targetLangs, langs);
+
+  let nextTranslations = results.translations && typeof results.translations === "object" ? results.translations : {};
+  if (clearTranslate) {
+    for (const l of langs) nextTranslations = deleteLangKey(nextTranslations, l);
+  }
+
+  const billing = it?.billing && typeof it.billing === "object" ? it.billing : {};
+  const translateTotal = Math.max(0, Number(unitTokens || 0) || 0) * langs.length;
+
+  const nextItems = [...items];
+  nextItems[idx] = {
+    ...it,
+    billing: { ...billing, translatePotentialTokens: translateTotal > 0 ? translateTotal : undefined },
+    status: {
+      ...status,
+      translate: {
+        ...prevTr,
+        state: "queued",
+        queuedAt: now,
+        error: null,
+        modelId: modelId || prevTr.modelId || null,
+        sourceLang: sourceLang || prevTr.sourceLang || null,
+        targetLangs: mergedTargets,
+        byLang: nextByLang,
+      },
+    },
+    results: {
+      ...results,
+      translations: nextTranslations,
+      updatedAt: now,
+    },
+    updatedAt: now,
+  };
+
+  const nextThread = { ...t, chatItems: nextItems, updatedAt: now };
+  const nextThreads = { ...cur, [tid]: nextThread };
+
+  setThreadsById(nextThreads);
+  threadsRef.current = nextThreads;
+
+  try {
+    if (scope && String(activeRef.current) === String(tid)) {
+      persist(nextThreads, activeRef.current, syncRef.current).catch(() => {});
+    }
+  } catch {}
+}
+
+
+
 export function ThreadsProvider({ children }) {
   const {
     user,
@@ -471,6 +794,9 @@ export function ThreadsProvider({ children }) {
   const threadsRef = useRef({});
   const activeRef = useRef("default");
   const syncRef = useRef({ indexAt: null });
+
+  const creatingThreadRef = useRef(false);
+const [creatingThread, setCreatingThread] = useState(false);
 
   useEffect(() => {
     threadsRef.current = threadsById;
@@ -708,6 +1034,101 @@ export function ThreadsProvider({ children }) {
     }
   };
 
+
+  const reserveForTranslateChatItems = (threadId, chatItemIds, normalizedOptions, { force, clearTranslate } = {}) => {
+    if (!canReserve) return;
+
+    const tid = String(threadId || "");
+    const ids = Array.isArray(chatItemIds) ? chatItemIds.map((x) => String(x || "")).filter(Boolean) : [];
+    if (!tid || !ids.length) return;
+
+   const t = (threadsRef.current || {})[tid];
+    const items = ensureChatItemsArray(t?.chatItems);
+
+    const tr = normalizedOptions?.translation && typeof normalizedOptions.translation === "object" ? normalizedOptions.translation : null;
+    const targetLangsAll = Array.isArray(tr?.targetLangs) ? tr.targetLangs.map(safeLangKey).filter(Boolean) : [];
+    if (!targetLangsAll.length) return;
+
+    const modelId = String(tr?.modelId || TR_DEFAULTS?.modelId || "gpt-4o-mini");
+    const sourceLang = String(tr?.sourceLang || TR_DEFAULTS?.sourceLang || "auto");
+
+    const estimateOpts =
+      tr?.estimate && typeof tr.estimate === "object"
+        ? tr.estimate
+        : null;
+
+    for (const cid of ids) {
+      const it = items.find((x) => String(x?.chatItemId || "") === cid);
+      if (!it) continue;
+
+      const langsQueued = langsToQueueFromStatus(it, targetLangsAll, !!force);
+      if (!langsQueued.length) continue;
+
+      const segs = getTranscriptSegmentsAny(it);
+      // translate retry should have transcript segments; if not, skip reserve
+      if (!segs.length) continue;
+
+      const seconds = Number(it?.media?.durationSeconds || it?.media?.duration || 0) || 0;
+      const unit = estimateTranslationUnitTokensDeterministic({ segments: segs, seconds, modelId, estimateOpts });
+      if (!(unit > 0)) continue;
+
+      // ✅ reserve per lang so we can release per lang later
+      for (const l of langsQueued) {
+        reserveKey(translateKey(tid, cid, l), unit);
+      }
+
+      // ✅ reflect "queued + reserved" on the item immediately (like transcribe)
+      setTranslateQueuedOnThread({
+        threadId: tid,
+        chatItemId: cid,
+        langsQueued,
+        unitTokens: unit,
+        modelId,
+        sourceLang,
+        allTargetLangs: targetLangsAll,
+        clearTranslate: !!clearTranslate,
+        setThreadsById,
+        threadsRef,
+        persist,
+        activeRef,
+        syncRef,
+        scope,
+      });
+
+      patchLiveChatItem(tid, cid, {
+       billing: { translatePotentialTokens: unit * langsQueued.length },
+        updatedAt: nowIso(),
+      });
+    }
+  };
+
+  const releaseForTranslateChatItem = (threadId, chatItemId, langs) => {
+    if (!canReserve) return;
+    const tid = String(threadId || "");
+    const cid = String(chatItemId || "");
+    if (!tid || !cid) return;
+
+    const ls = Array.isArray(langs) ? langs.map(safeLangKey).filter(Boolean) : [];
+    if (ls.length) {
+      for (const l of ls) releaseKey(translateKey(tid, cid, l));
+      return;
+    }
+
+    // release all translate keys for this chat item
+    const prefix = `${tid}:chat:${cid}:tr:`;
+    const keys = Object.keys(reservedKeysRef.current || {});
+    for (const k of keys) {
+      if (k.startsWith(prefix)) releaseKey(k);
+    }
+  };
+
+  const releaseForTranslateChatItems = (threadId, chatItemIds) => {
+    const tid = String(threadId || "");
+    const ids = Array.isArray(chatItemIds) ? chatItemIds.map((x) => String(x || "")).filter(Boolean) : [];
+    if (!tid || !ids.length) return;
+    for (const cid of ids) releaseForTranslateChatItem(tid, cid);
+  };
+
   const reserveForDraftItemIds = (threadId, itemIds) => {
     if (!canReserve) return;
 
@@ -813,27 +1234,28 @@ export function ThreadsProvider({ children }) {
     const threadId = String(msg?.threadId || "");
 
     if (type === "HELLO_OK") {
-      setWsError(null);
-      setWsStatus("ready");
+  setWsError(null);
+  setWsStatus("ready");
 
-      try {
-        const p = msg?.payload || {};
-        if (typeof applyTokensSnapshot === "function") {
-          applyTokensSnapshot({
-            mediaTokens: p.mediaTokens,
-            mediaTokensBalance: p.mediaTokensBalance,
-            mediaTokensReserved: p.mediaTokensReserved,
-            pricingVersion: p.pricingVersion || null,
-            serverTime: p.serverTime || p.ts || null,
-          });
-        }
+  try {
+    const p = msg?.payload || {};
 
-        // authoritative => clear optimistic
-        clearAllOptimisticReservations();
-      } catch {}
-
-      return;
+    // ✅ prevent "flash to 0": only apply fields that actually exist
+    const patch = pickTokenPatch(p);
+    if (patch && typeof applyTokensSnapshot === "function") {
+      applyTokensSnapshot(patch);
     }
+
+    // ✅ don't nuke optimistic reservations just because a new WS connected
+    // (creating/switching threads can otherwise drop the blue "pending" too early)
+    const hasOptimistic = Object.keys(reservedKeysRef.current || {}).length > 0;
+    if (!hasOptimistic) {
+      clearAllOptimisticReservations();
+    }
+  } catch {}
+
+  return;
+}
 
     if (type === "TOKENS_UPDATED") {
       const payload = msg?.payload || {};
@@ -1102,99 +1524,144 @@ export function ThreadsProvider({ children }) {
     }
 
     if (type === "CHAT_ITEM_SEGMENTS") {
-      const chatItemId = String(msg?.payload?.chatItemId || "");
-      const step = String(msg?.payload?.step || "transcribe");
-      const incoming = Array.isArray(msg?.payload?.segments) ? msg.payload.segments : [];
-      const append = !!msg?.payload?.append;
-      if (!chatItemId) return;
+  const chatItemId = String(msg?.payload?.chatItemId || "");
+  const step = String(msg?.payload?.step || "transcribe");
+  const lang = String(msg?.payload?.lang || msg?.payload?.targetLang || ""); // ✅ NEW
+  const incoming = Array.isArray(msg?.payload?.segments) ? msg.payload.segments : [];
+  const append = !!msg?.payload?.append;
+  if (!chatItemId) return;
 
-      setLiveRunsByThread((prev) => {
-        const cur = (prev && prev[threadId]) || {};
-        const chatItems = cur.chatItems && typeof cur.chatItems === "object" ? cur.chatItems : {};
-        const existing = chatItems[chatItemId] || {};
+  setLiveRunsByThread((prev) => {
+    const cur = (prev && prev[threadId]) || {};
+    const chatItems = cur.chatItems && typeof cur.chatItems === "object" ? cur.chatItems : {};
+    const existing = chatItems[chatItemId] || {};
 
-        const segObj = existing.segments && typeof existing.segments === "object" ? existing.segments : {};
-        const arr = Array.isArray(segObj[step]) ? segObj[step] : [];
-        const nextArr = append ? [...arr, ...incoming] : [...incoming];
+    const segObj = existing.segments && typeof existing.segments === "object" ? existing.segments : {};
+    const existingStep = segObj[step];
 
-        return {
-          ...(prev || {}),
-          [threadId]: {
-            ...cur,
-            chatItems: {
-              ...chatItems,
-              [chatItemId]: { ...existing, segments: { ...segObj, [step]: nextArr }, updatedAt: nowIso() },
-            },
+    let nextStepValue;
+
+    if (lang) {
+      const stepMap = existingStep && typeof existingStep === "object" && !Array.isArray(existingStep) ? existingStep : {};
+      const arr = Array.isArray(stepMap[lang]) ? stepMap[lang] : [];
+      const nextArr = append ? [...arr, ...incoming] : [...incoming];
+      nextStepValue = { ...stepMap, [lang]: nextArr };
+    } else {
+      const arr = Array.isArray(existingStep) ? existingStep : [];
+      nextStepValue = append ? [...arr, ...incoming] : [...incoming];
+    }
+
+    return {
+      ...(prev || {}),
+      [threadId]: {
+        ...cur,
+        chatItems: {
+          ...chatItems,
+          [chatItemId]: {
+            ...existing,
+            segments: { ...segObj, [step]: nextStepValue },
             updatedAt: nowIso(),
           },
-        };
-      });
-      return;
-    }
+        },
+        updatedAt: nowIso(),
+      },
+    };
+  });
+
+  return;
+}
+
 
     if (type === "CHAT_ITEM_PROGRESS") {
-      const chatItemId = String(msg?.payload?.chatItemId || "");
-      const step = String(msg?.payload?.step || "");
-      const progress = Number(msg?.payload?.progress || 0);
-      if (!chatItemId || !step) return;
+  const chatItemId = String(msg?.payload?.chatItemId || "");
+  const step = String(msg?.payload?.step || "");
+  const lang = String(msg?.payload?.lang || msg?.payload?.targetLang || ""); // ✅ NEW
+  const progress = Number(msg?.payload?.progress || 0);
+  if (!chatItemId || !step) return;
 
-      setLiveRunsByThread((prev) => {
-        const cur = (prev && prev[threadId]) || {};
-        const chatItems = cur.chatItems && typeof cur.chatItems === "object" ? cur.chatItems : {};
-        const existing = chatItems[chatItemId] || {};
-        const existingProgress = existing.progress && typeof existing.progress === "object" ? existing.progress : {};
+  setLiveRunsByThread((prev) => {
+    const cur = (prev && prev[threadId]) || {};
+    const chatItems = cur.chatItems && typeof cur.chatItems === "object" ? cur.chatItems : {};
+    const existing = chatItems[chatItemId] || {};
+    const existingProgress = existing.progress && typeof existing.progress === "object" ? existing.progress : {};
+    const existingStep = existingProgress[step];
 
-        return {
-          ...(prev || {}),
-          [threadId]: {
-            ...cur,
-            chatItems: {
-              ...chatItems,
-              [chatItemId]: {
-                ...existing,
-                progress: { ...existingProgress, [step]: progress },
-                lastProgressAt: nowIso(),
-                updatedAt: nowIso(),
-              },
-            },
+    let nextStepValue;
+
+    if (lang) {
+      const stepMap = existingStep && typeof existingStep === "object" && !Array.isArray(existingStep) ? existingStep : {};
+      nextStepValue = { ...stepMap, [lang]: progress };
+    } else {
+      nextStepValue = progress;
+    }
+
+    return {
+      ...(prev || {}),
+      [threadId]: {
+        ...cur,
+        chatItems: {
+          ...chatItems,
+          [chatItemId]: {
+            ...existing,
+            progress: { ...existingProgress, [step]: nextStepValue },
+            lastProgressAt: nowIso(),
             updatedAt: nowIso(),
           },
-        };
-      });
-      return;
-    }
+        },
+        updatedAt: nowIso(),
+      },
+    };
+  });
+
+  return;
+}
+
 
     if (type === "CHAT_ITEM_STREAM") {
-      const chatItemId = String(msg?.payload?.chatItemId || "");
-      const step = String(msg?.payload?.step || "");
-      const text = String(msg?.payload?.text || "");
-      if (!chatItemId || !step || !text) return;
+  const chatItemId = String(msg?.payload?.chatItemId || "");
+  const step = String(msg?.payload?.step || "");
+  const lang = String(msg?.payload?.lang || msg?.payload?.targetLang || ""); // ✅ NEW
+  const text = String(msg?.payload?.text || "");
+  if (!chatItemId || !step || !text) return;
 
-      setLiveRunsByThread((prev) => {
-        const cur = (prev && prev[threadId]) || {};
-        const chatItems = cur.chatItems && typeof cur.chatItems === "object" ? cur.chatItems : {};
-        const existing = chatItems[chatItemId] || {};
-        const stream = existing.stream && typeof existing.stream === "object" ? existing.stream : {};
-        const arr = Array.isArray(stream[step]) ? stream[step] : [];
+  setLiveRunsByThread((prev) => {
+    const cur = (prev && prev[threadId]) || {};
+    const chatItems = cur.chatItems && typeof cur.chatItems === "object" ? cur.chatItems : {};
+    const existing = chatItems[chatItemId] || {};
+    const stream = existing.stream && typeof existing.stream === "object" ? existing.stream : {};
+    const existingStep = stream[step];
 
-        return {
-          ...(prev || {}),
-          [threadId]: {
-            ...cur,
-            chatItems: {
-              ...chatItems,
-              [chatItemId]: {
-                ...existing,
-                stream: { ...stream, [step]: [...arr, text] },
-                updatedAt: nowIso(),
-              },
-            },
+    let nextStepValue;
+
+    if (lang) {
+      const stepMap = existingStep && typeof existingStep === "object" && !Array.isArray(existingStep) ? existingStep : {};
+      const arr = Array.isArray(stepMap[lang]) ? stepMap[lang] : [];
+      nextStepValue = { ...stepMap, [lang]: [...arr, text] };
+    } else {
+      const arr = Array.isArray(existingStep) ? existingStep : [];
+      nextStepValue = [...arr, text];
+    }
+
+    return {
+      ...(prev || {}),
+      [threadId]: {
+        ...cur,
+        chatItems: {
+          ...chatItems,
+          [chatItemId]: {
+            ...existing,
+            stream: { ...stream, [step]: nextStepValue },
             updatedAt: nowIso(),
           },
-        };
-      });
-      return;
-    }
+        },
+        updatedAt: nowIso(),
+      },
+    };
+  });
+
+  return;
+}
+
 
     if (type === "CHAT_ITEM_UPDATED") {
       const chatItemId = String(msg?.payload?.chatItemId || "");
@@ -1215,6 +1682,27 @@ export function ThreadsProvider({ children }) {
         }
       } catch {}
 
+      // ✅ release translate optimistic per-lang when done/failed/blocked
+      try {
+        const tr = patch?.status?.translate && typeof patch.status.translate === "object" ? patch.status.translate : null;
+        const rootState = String(tr?.state || "");
+
+        if (rootState === "done" || rootState === "failed" || rootState === "blocked") {
+          releaseForTranslateChatItem(threadId, chatItemId);
+          refreshTokensThrottled().catch(() => {});
+        } else {
+          const byLang = tr?.byLang && typeof tr.byLang === "object" ? tr.byLang : null;
+          if (byLang) {
+            const finished = [];
+            for (const [lang, row] of Object.entries(byLang)) {
+              const s = String(row?.state || "");
+              if (s === "done" || s === "failed" || s === "blocked") finished.push(lang);
+            }
+            if (finished.length) releaseForTranslateChatItem(threadId, chatItemId, finished);
+          }
+        }
+      } catch {}
+
       const cur = threadsRef.current || {};
       const t = cur[threadId];
       if (!t) return;
@@ -1226,11 +1714,21 @@ export function ThreadsProvider({ children }) {
       const nextItems = [...items];
       nextItems[idx] = applyChatItemPatch(nextItems[idx], patch);
 
-      const nextThread = { ...t, chatItems: nextItems };
-      const nextThreads = { ...cur, [threadId]: nextThread };
-      setThreadsById(nextThreads);
-      threadsRef.current = nextThreads;
-      return;
+const nextThread = { ...t, chatItems: nextItems, updatedAt: nowIso() };
+const nextThreads = { ...cur, [threadId]: nextThread };
+
+setThreadsById(nextThreads);
+threadsRef.current = nextThreads;
+
+// ✅ persist so refresh keeps the latest translations
+try {
+  if (scope && String(activeRef.current) === String(threadId)) {
+    persist(nextThreads, activeRef.current, syncRef.current).catch(() => {});
+  }
+} catch {}
+
+return;
+
     }
 
     if (type === "RUN_COMPLETED") {
@@ -1248,6 +1746,7 @@ export function ThreadsProvider({ children }) {
         const liveT = threadsRef.current?.[tid];
         const ids = ensureChatItemsArray(liveT?.chatItems).map((x) => String(x?.chatItemId || "")).filter(Boolean);
         releaseForChatItems(tid, ids);
+        releaseForTranslateChatItems(tid, ids);
       } catch {}
 
       refreshTokensThrottled().catch(() => {});
@@ -1471,42 +1970,69 @@ export function ThreadsProvider({ children }) {
 
   // --------- CRUD ----------
   const createThread = async () => {
-    const localThread = makeNewThread(`Thread ${new Date().toLocaleString()}`);
+  if (creatingThreadRef.current) {
+    toast.message("Already creating a thread…");
+    return null;
+  }
 
-    return toast.promise(
-      (async () => {
-        if (!isAnonymous) {
-          const jwt = await getJwtIfAny();
-          if (!jwt) throw new Error("Unable to create JWT");
+  creatingThreadRef.current = true;
+  setCreatingThread(true);
 
-          const r = await apiCreateThread(jwt, { threadId: localThread.id, title: localThread.title });
-          const serverThread = r?.thread;
+  const localThread = makeNewThread(`Thread ${new Date().toLocaleString()}`);
 
-          if (serverThread?.id) {
-            localThread.createdAt = serverThread.createdAt || localThread.createdAt;
-            localThread.updatedAt = serverThread.updatedAt || localThread.updatedAt;
-            localThread.version = serverThread.version || localThread.version;
-            localThread.server = ensureServerShape({
-              updatedAt: serverThread.updatedAt || null,
-              draftUpdatedAt: serverThread.draftUpdatedAt || null,
-              version: serverThread.version ?? null,
-              draftRev: serverThread.draftRev ?? null,
-            });
-          }
-        }
+  const promise = (async () => {
+    if (!isAnonymous) {
+      const jwt = await getJwtIfAny();
+      if (!jwt) throw new Error("Unable to create JWT");
 
-        const cur = threadsRef.current || {};
-        const next = { ...cur, [localThread.id]: localThread };
-        await commit(next, localThread.id, syncRef.current);
-        return localThread.id;
-      })(),
-      {
-        loading: "Creating thread…",
-        success: "Thread created",
-        error: (e) => e?.message || "Failed to create thread",
+      const r = await apiCreateThread(jwt, {
+        threadId: localThread.id,
+        title: localThread.title,
+      });
+
+      const serverThread = r?.thread;
+      if (serverThread?.id) {
+        localThread.createdAt = serverThread.createdAt || localThread.createdAt;
+        localThread.updatedAt = serverThread.updatedAt || localThread.updatedAt;
+        localThread.version = serverThread.version || localThread.version;
+        localThread.server = ensureServerShape({
+          updatedAt: serverThread.updatedAt || null,
+          draftUpdatedAt: serverThread.draftUpdatedAt || null,
+          version: serverThread.version ?? null,
+          draftRev: serverThread.draftRev ?? null,
+        });
       }
-    );
-  };
+    }
+
+    const cur = threadsRef.current || {};
+    const next = { ...cur, [localThread.id]: localThread };
+    await commit(next, localThread.id, syncRef.current);
+    return localThread.id;
+  })();
+
+  toast.promise(promise, {
+    loading: "Creating thread…",
+    success: "Thread created",
+    error: (e) => e?.message || "Failed to create thread",
+  });
+
+  try {
+    return await promise;
+  } catch (e) {
+    // ✅ IMPORTANT: prevent Next dev overlay from taking over
+    // Optional: special-case limits / upgrade UI here
+    if (e?.statusCode === 403) {
+      // toast.error(e.message) // already handled by toast.promise
+      // openUpgradeModal?.()
+    }
+    return null;
+  } finally {
+    creatingThreadRef.current = false;
+    setCreatingThread(false);
+  }
+};
+
+
 
   const renameThread = async (threadId, title) => {
     if (!threadId || threadId === "default") return;
@@ -1897,26 +2423,207 @@ export function ThreadsProvider({ children }) {
     );
   };
 
-  const saveSrt = async ({ chatItemId, transcriptSrt, transcriptText }) => {
-    const tid = wsBoundThreadRef.current || activeRef.current;
-    if (!tid || tid === "default") {
-      toast.error("No thread selected.");
-      return false;
+  function normalizeWhitespace(t) {
+  return String(t || "").replace(/\s+/g, " ").trim();
+}
+
+function parseTimecodeToSeconds(tc) {
+  const s = String(tc || "").trim();
+  const m = s.match(/^(\d+):(\d+):(\d+),(\d+)$/);
+  if (!m) return null;
+  const hh = Number(m[1] || 0);
+  const mm = Number(m[2] || 0);
+  const ss = Number(m[3] || 0);
+  const ms = Number(m[4] || 0);
+  if (![hh, mm, ss, ms].every((x) => Number.isFinite(x))) return null;
+  return hh * 3600 + mm * 60 + ss + ms / 1000;
+}
+
+const clearLiveTranslateLangs = (threadId, chatItemId, langs) => {
+  const tid = String(threadId || "");
+  const cid = String(chatItemId || "");
+  const ls = Array.isArray(langs) ? langs.map((x) => safeLangKey(x)).filter(Boolean) : [];
+  if (!tid || !cid || !ls.length) return;
+
+  setLiveRunsByThread((prev) => {
+    const cur = (prev && prev[tid]) || {};
+    const chatItems = cur.chatItems && typeof cur.chatItems === "object" ? cur.chatItems : {};
+    const existing = chatItems[cid] || {};
+
+    const stream = existing.stream && typeof existing.stream === "object" ? existing.stream : {};
+    const progress = existing.progress && typeof existing.progress === "object" ? existing.progress : {};
+    const segments = existing.segments && typeof existing.segments === "object" ? existing.segments : {};
+
+    const trStream =
+      stream.translate && typeof stream.translate === "object" && !Array.isArray(stream.translate) ? stream.translate : {};
+    const trProg =
+      progress.translate && typeof progress.translate === "object" && !Array.isArray(progress.translate)
+        ? progress.translate
+        : {};
+    const trSegs =
+      segments.translate && typeof segments.translate === "object" && !Array.isArray(segments.translate)
+        ? segments.translate
+        : {};
+
+    const nextTrStream = { ...trStream };
+    const nextTrProg = { ...trProg };
+    const nextTrSegs = { ...trSegs };
+
+    for (const l of ls) {
+      nextTrStream[l] = [];
+      nextTrProg[l] = 0;
+      nextTrSegs[l] = [];
     }
-    if (!wsClientRef.current || !wsClientRef.current.isConnected()) {
-      toast.error("Not connected to the realtime server yet.");
-      return false;
-    }
-    const payload = {
-      threadId: String(tid),
-      chatItemId: String(chatItemId),
-      transcriptSrt: String(transcriptSrt || ""),
-      transcriptText: String(transcriptText || ""),
+
+    return {
+      ...(prev || {}),
+      [tid]: {
+        ...cur,
+        chatItems: {
+          ...chatItems,
+          [cid]: {
+            ...existing,
+            stream: { ...stream, translate: nextTrStream },
+            progress: { ...progress, translate: nextTrProg },
+            segments: { ...segments, translate: nextTrSegs },
+            updatedAt: nowIso(),
+          },
+        },
+        updatedAt: nowIso(),
+      },
     };
-    const ok = wsClientRef.current.send("SAVE_SRT", payload);
-    if (!ok) toast.error("Failed to send SAVE_SRT");
-    return ok;
+  });
+};
+
+
+function srtToSegments(srt) {
+  const raw = String(srt || "").trim();
+  if (!raw) return [];
+  const blocks = raw.split(/\n\s*\n/g);
+  const out = [];
+
+  for (const b of blocks) {
+    const lines = b.split("\n").map((x) => String(x || "").trim());
+    if (lines.length < 3) continue;
+
+    const ts = lines[1] || "";
+    const parts = ts.split(" --> ");
+    if (parts.length !== 2) continue;
+
+    const start = parseTimecodeToSeconds(parts[0]);
+    const end = parseTimecodeToSeconds(parts[1]);
+    if (start == null || end == null) continue;
+
+    const text = normalizeWhitespace(lines.slice(2).join("\n"));
+    if (!text) continue;
+
+    out.push({ start, end, text });
+  }
+
+  out.sort((a, b) => a.start - b.start || a.end - b.end);
+  return out;
+}
+
+function normalizeSegmentsForWs(segments) {
+  const arr = Array.isArray(segments) ? segments : [];
+  const clean = [];
+
+  for (const s of arr) {
+    const start = Number(s?.start);
+    const end = Number(s?.end);
+    const text = String(s?.text || "").trim();
+
+    if (!Number.isFinite(start) || !Number.isFinite(end)) continue;
+    if (end < start) continue;
+    if (!text) continue;
+
+    clean.push({ start: Math.max(0, start), end: Math.max(0, end), text });
+  }
+
+  clean.sort((a, b) => a.start - b.start || a.end - b.end);
+  return clean;
+}
+
+
+  const saveSrt = async ({ chatItemId, transcriptSrt, segments } = {}) => {
+  const tid = wsBoundThreadRef.current || activeRef.current;
+  if (!tid || tid === "default") {
+    toast.error("No thread selected.");
+    return false;
+  }
+  if (!wsClientRef.current || !wsClientRef.current.isConnected()) {
+    toast.error("Not connected to the realtime server yet.");
+    return false;
+  }
+
+  const segsRaw = Array.isArray(segments) ? segments : srtToSegments(transcriptSrt);
+  const segs = normalizeSegmentsForWs(segsRaw);
+
+  if (!String(chatItemId || "").trim()) {
+    toast.error("Missing chatItemId.");
+    return false;
+  }
+  if (!segs.length) {
+    toast.error("No segments to save.");
+    return false;
+  }
+
+  const payload = {
+    threadId: String(tid),
+    chatItemId: String(chatItemId),
+    segments: segs,
   };
+
+  const ok = wsClientRef.current.send("SAVE_SEGMENTS", payload);
+  if (!ok) toast.error("Failed to send SAVE_SEGMENTS");
+  return ok;
+};
+
+
+const saveTranslationSrt = async ({ chatItemId, lang, translationSrt, segments } = {}) => {
+  const tid = wsBoundThreadRef.current || activeRef.current;
+  if (!tid || tid === "default") {
+    toast.error("No thread selected.");
+    return false;
+  }
+  if (!wsClientRef.current || !wsClientRef.current.isConnected()) {
+    toast.error("Not connected to the realtime server yet.");
+    return false;
+  }
+
+  const cid = String(chatItemId || "").trim();
+  const l = safeLangKey(lang); // ✅ match server canonicalization
+
+  if (!cid) {
+    toast.error("Missing chatItemId.");
+    return false;
+  }
+  if (!l) {
+    toast.error("Missing translation language.");
+    return false;
+  }
+
+  const segsRaw = Array.isArray(segments) ? segments : srtToSegments(translationSrt);
+  const segs = normalizeSegmentsForWs(segsRaw);
+
+  if (!segs.length) {
+    toast.error("No translation segments to save.");
+    return false;
+  }
+
+  const payload = {
+    threadId: String(tid),
+    chatItemId: cid,
+    lang: l,
+    segments: segs,
+  };
+
+  const ok = wsClientRef.current.send("SAVE_TRANSLATION_SEGMENTS", payload);
+  if (!ok) toast.error("Failed to send SAVE_TRANSLATION_SEGMENTS");
+  return ok;
+};
+
+
 
   // --------- START / RETRY ----------
   const clearTranscribeFieldsOnThread = (threadId, chatItemId) => {
@@ -1972,6 +2679,148 @@ export function ThreadsProvider({ children }) {
     if (String(activeRef.current) === tid) persist(nextThreads, activeRef.current, syncRef.current).catch(() => {});
   };
 
+
+  const clearTranslateFieldsOnThread = (threadId, chatItemId, targetLangs) => {
+  const tid = String(threadId || "");
+  const cid = String(chatItemId || "");
+const langs = Array.isArray(targetLangs)
+  ? targetLangs.map((x) => safeLangKey(x)).filter(Boolean)
+  : [];
+
+  if (!tid || !cid) return;
+
+  const cur = threadsRef.current || {};
+  const t = cur[tid];
+  if (!t) return;
+
+  const items = ensureChatItemsArray(t.chatItems);
+  const idx = items.findIndex((x) => String(x?.chatItemId || "") === cid);
+  if (idx < 0) return;
+
+  const it = items[idx] || {};
+  const status = it.status || {};
+  const results = it.results || {};
+
+  const prevTranslations =
+    results.translations && typeof results.translations === "object" ? results.translations : {};
+
+
+  const prevTr = status.translate && typeof status.translate === "object" ? status.translate : {};
+  const prevByLang = prevTr.byLang && typeof prevTr.byLang === "object" ? prevTr.byLang : {};
+
+let nextTranslations = prevTranslations || {};
+for (const l of langs) nextTranslations = deleteLangKey(nextTranslations, l);
+
+let nextByLang = prevByLang || {};
+for (const l of langs) nextByLang = deleteLangKey(nextByLang, l);
+
+
+  const nextItems = [...items];
+  nextItems[idx] = {
+    ...it,
+    status: {
+      ...status,
+      translate: {
+        ...prevTr,
+        state: "queued",
+        stage: "queued",
+        queuedAt: nowIso(),
+        error: null,
+        byLang: nextByLang,
+      },
+    },
+    results: {
+      ...results,
+      translations: nextTranslations,
+      // keep results.translation (single) optional; up to you:
+      translation: "",
+      updatedAt: nowIso(),
+    },
+    updatedAt: nowIso(),
+  };
+
+  const nextThread = { ...t, chatItems: nextItems, updatedAt: nowIso() };
+  const nextThreads = { ...cur, [tid]: nextThread };
+  setThreadsById(nextThreads);
+  threadsRef.current = nextThreads;
+
+  if (String(activeRef.current) === tid) persist(nextThreads, activeRef.current, syncRef.current).catch(() => {});
+};
+
+const retryTranslate = async ({ chatItemIds, chatItemId, options } = {}) => {
+  const tid = wsBoundThreadRef.current || activeRef.current;
+  if (!tid || tid === "default") {
+    toast.error("No thread selected.");
+    return false;
+  }
+  if (!wsClientRef.current || !wsClientRef.current.isConnected()) {
+    toast.error("Not connected to the realtime server yet.");
+    return false;
+  }
+
+  const ids =
+    Array.isArray(chatItemIds) && chatItemIds.length
+      ? chatItemIds.map((x) => String(x || "")).filter(Boolean)
+      : chatItemId
+      ? [String(chatItemId)]
+      : [];
+
+  if (!ids.length) {
+    toast.error("No chatItemId(s) provided.");
+    return false;
+  }
+
+  const normalized = normalizeRunOptions(options);
+  const wantClearTranslate = !!normalized?.clearTranslate;
+const runLangs =
+  normalized?.translation?.targetLangs && Array.isArray(normalized.translation.targetLangs)
+    ? normalized.translation.targetLangs
+    : [];
+
+
+  // If clearing, clear local live buffers & thread fields for those target langs
+  if (wantClearTranslate) {
+    const targetLangs =
+      normalized?.translation?.targetLangs && Array.isArray(normalized.translation.targetLangs)
+        ? normalized.translation.targetLangs
+        : [];
+
+    for (const cid of ids) {
+      if (wantClearTranslate) {
+        patchLiveChatItem(tid, cid, {
+          stream: { translate: {} },
+          progress: { translate: {} },
+          segments: { translate: {} },
+          updatedAt: nowIso(),
+        });
+        clearTranslateFieldsOnThread(tid, cid, runLangs);
+      } else {
+        // ✅ re-run only requested langs: reset live buffers for those langs only
+        clearLiveTranslateLangs(tid, cid, runLangs);
+      }
+    }
+
+  }
+
+  const payload = {
+    threadId: String(tid),
+    chatItemIds: ids,
+    options: normalized,
+  };
+
+  // ✅ optimistic reserve immediately (shows in badge blue pending)
+  // reserve only langs that would actually queue (unless force)
+  reserveForTranslateChatItems(tid, ids, normalized, {
+    force: !!normalized?.force,
+    clearTranslate: wantClearTranslate,
+  });
+
+  const ok = wsClientRef.current.send("RETRY_TRANSLATE", payload);
+  if (!ok) toast.error("Failed to send RETRY_TRANSLATE");
+  return ok;
+};
+
+
   const retryTranscribe = async ({ chatItemIds, chatItemId, options } = {}) => {
     const tid = wsBoundThreadRef.current || activeRef.current;
     if (!tid || tid === "default") {
@@ -1998,7 +2847,7 @@ export function ThreadsProvider({ children }) {
     const payload = {
       threadId: String(tid),
       chatItemIds: ids,
-      options: options && typeof options === "object" ? options : {},
+      options: normalizeRunOptions(options),
     };
 
     const wantClear = !!(payload.options && payload.options.clear);
@@ -2051,7 +2900,7 @@ export function ThreadsProvider({ children }) {
     const payload = {
       threadId: String(tid),
       itemIds: ids,
-      options: options && typeof options === "object" ? options : {},
+      options: normalizeRunOptions(options),
     };
 
     const ok = wsClientRef.current.send("START_RUN", payload);
@@ -2069,6 +2918,7 @@ export function ThreadsProvider({ children }) {
 
     syncFromServer,
 
+    creatingThread,
     createThread,
     renameThread,
     deleteThread,
@@ -2083,10 +2933,12 @@ export function ThreadsProvider({ children }) {
     liveRunsByThread,
     startRun,
     retryTranscribe,
+    retryTranslate,
     requestThreadSnapshot,
     requestMediaUrl,
 
     saveSrt,
+    saveTranslationSrt, // ✅ add this
   };
 
   return <ThreadsContext.Provider value={value}>{children}</ThreadsContext.Provider>;
