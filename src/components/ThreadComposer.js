@@ -830,6 +830,8 @@ const summarizeMini = useMemo(() => {
 
     return {
       show: true,
+      ok: false,
+      totalNeed: null,
       state: "unknown",
       text: "—",
       title: unknownCount ? `Missing duration on ${unknownCount} file(s) — can’t estimate total.` : "Can’t estimate total.",
@@ -842,8 +844,14 @@ const summarizeMini = useMemo(() => {
     .map((p) => `${p.label}: ${Number(p.need || 0) || 0}`)
     .join(" • ");
 
-  return { show: true, state: "ok", text: formatCompact(need), title: `Total est.: ${need} media tokens • ${title}` };
- 
+     return {
+     show: true,
+    ok: true,
+    totalNeed: need,
+     state: "ok",
+     text: formatCompact(need),
+     title: `Total est.: ${need} media tokens • ${title}`,
+   };
 
  }, [
    hasReadyMedia,
@@ -861,24 +869,22 @@ const summarizeMini = useMemo(() => {
     if (busyUploading) return { disabled: true, text: "Uploading…", title: "Finish uploading/converting first" };
     if (!hasReadyMedia) return { disabled: true, text: "Add media", title: "Upload/link at least one media file first" };
 
-if (doTranscribe || doTranslate) {
-  if (totalBadge.show && totalBadge.ok && Number(totalBadge.totalNeed || 0) > availableTokens) {
-    return {
-      disabled: true,
-      text: "No tokens",
-      title: totalBadge.title || `Need more tokens.`,
-    };
+  if (doTranscribe || doTranslate || doSummarize) {
+    if (totalNeed == null) {
+      return {
+       disabled: true,
+        text: "Duration",
+        title: totalBadge?.title || "Cannot estimate total cost (missing duration).",
+      };
+    }
+    if (totalNeed > availableTokens) {
+      return {
+        disabled: true,
+        text: "No tokens",
+        title: totalBadge?.title || `Need ${totalNeed} tokens, have ${availableTokens}.`,
+      };
+    }
   }
-
-  // If either estimate is unknown, keep your current “Duration” style block.
-  if (totalBadge.show && !totalBadge.ok) {
-    return {
-      disabled: true,
-      text: "Duration",
-      title: totalBadge.title || "Cannot estimate total cost (missing duration).",
-    };
-  }
-}
 
 
     if (!wsIsReady) {
@@ -894,15 +900,19 @@ if (doTranscribe || doTranslate) {
 
     return { disabled: false, text: "Start", title: "Start processing" };
   }, [
-    threadIsValid,
-    hasAnyOption,
-    busyUploading,
-    hasReadyMedia,
-    wsIsReady,
-    wsStatus,
-    doTranscribe,
-    billingEstimate,
-    availableTokens,
+   threadIsValid,
+   hasAnyOption,
+   busyUploading,
+   hasReadyMedia,
+   wsIsReady,
+   wsStatus,
+   doTranscribe,
+  doTranslate,
+  doSummarize,
+   billingEstimate,
+  totalNeed,
+  totalBadge,
+   availableTokens,
   ]);
 
     // Confirm "started" once items show up in chatItems (or disappear from draft)
