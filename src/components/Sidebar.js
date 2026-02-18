@@ -22,6 +22,8 @@ export default function Sidebar({
 
   onGoogleLogin,
   onLogout,
+
+  onStartCheckout,
 }) {
   // ---- base available (server snapshot preferred) ----
   const availableRaw =
@@ -143,6 +145,7 @@ export default function Sidebar({
             pendingMediaTokens={pending}
             onGoogleLogin={onGoogleLogin}
             onLogout={onLogout}
+            onStartCheckout={onStartCheckout} // ✅
           />
         )}
 

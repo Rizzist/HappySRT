@@ -16,6 +16,12 @@ import * as TranslationImport from "../shared/translationCatalog";
 import * as TranslationBillingImport from "../shared/translationBillingCatalog";
 import * as SummarizationBillingImport from "../shared/summarizationBillingCatalog";
 
+import { requestUpgrade } from "../lib/upgradeBus";
+
+import PlansImport from "../shared/plans";
+const Plans = (PlansImport && (PlansImport.default || PlansImport)) || {};
+const { formatBytes } = Plans;
+
 const TranslationCatalog = (TranslationImport && (TranslationImport.default || TranslationImport)) || {};
 const TR_DEFAULTS = TranslationCatalog?.DEFAULTS || {};
 
@@ -26,6 +32,54 @@ const SummarizationBilling =
   (SummarizationBillingImport && (SummarizationBillingImport.default || SummarizationBillingImport)) || {};
 
 const ThreadsContext = createContext(null);
+
+
+const UPGRADE_CODES = new Set([
+  "MAX_FILE_SIZE_EXCEEDED",
+  "STORAGE_LIMIT_EXCEEDED",
+  "MONTHLY_UPLOAD_LIMIT_EXCEEDED",
+]);
+
+function isUpgradeLimitError(e) {
+  const c = String(e?.code || "");
+  return UPGRADE_CODES.has(c);
+}
+
+function fmtBytes(n) {
+  const x = Number(n || 0) || 0;
+  return typeof formatBytes === "function" ? formatBytes(x) : `${x} bytes`;
+}
+
+function formatUpgradeMessage(e) {
+  const code = String(e?.code || "");
+  const p = e?.payload || {};
+
+  if (code === "MAX_FILE_SIZE_EXCEEDED") {
+    return `File too large (${fmtBytes(p.fileBytes)}). Your plan allows up to ${fmtBytes(p.maxFileBytes)}. Upgrade to upload bigger files.`;
+  }
+
+  if (code === "STORAGE_LIMIT_EXCEEDED") {
+    const s = p.storage || {};
+    return `Storage limit reached (${fmtBytes(s.usedBytes)} / ${fmtBytes(s.limitBytes)}). Upgrade to upload more.`;
+  }
+
+  if (code === "MONTHLY_UPLOAD_LIMIT_EXCEEDED") {
+    const m = p.monthly || {};
+    const month = p.month || m.month || "";
+    return `Monthly upload limit reached${month ? ` (${month})` : ""}: ${fmtBytes(m.usedBytes)} / ${fmtBytes(m.limitBytes)}. Upgrade to keep uploading.`;
+  }
+
+  return e?.message || "Upgrade required.";
+}
+
+function openUpgradeFromError(e) {
+  requestUpgrade({
+    code: e?.code || null,
+    payload: e?.payload || null,
+    at: Date.now(),
+  });
+}
+
 
 function toArray(threadsById) {
   return Object.values(threadsById || {}).sort((a, b) => {
@@ -489,6 +543,7 @@ async function postJson(url, jwt, body) {
     const err = new Error(data?.message || "Request failed");
     err.statusCode = res.status;
     err.code = data?.code;
+    err.payload = data; // ✅ ADD THIS
     throw err;
   }
   return data;
@@ -510,10 +565,12 @@ async function postForm(url, jwt, formData) {
     const err = new Error(data?.message || "Request failed");
     err.statusCode = res.status;
     err.code = data?.code;
+    err.payload = data; // ✅ ADD THIS
     throw err;
   }
   return data;
 }
+
 
 async function apiThreadsIndex(jwt, { since }) {
   return postJson("/api/threads/indexer", jwt, { since: since || null });
@@ -2517,8 +2574,15 @@ return;
             }
           } catch {}
 
+          // ✅ NEW: auto-open upgrade + better toast message
+          if (isUpgradeLimitError(e)) {
+            openUpgradeFromError(e);
+            return formatUpgradeMessage(e); // this becomes the toast.promise error text
+          }
+
           return e?.message || "Upload failed";
         },
+
       }
     );
   };

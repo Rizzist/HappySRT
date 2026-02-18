@@ -23,14 +23,12 @@ export default async function handler(req, res) {
     if (!uid) return res.status(401).json({ message: "Unauthorized" });
 
     const providerNorm = normalizeProvider(provider);
-    const desiredMin =
-      Number(mediaTokensMin || 0) || (providerNorm === "google" ? 50 : 5);
+    const desiredMin = Number(mediaTokensMin || 0) || (providerNorm === "google" ? 50 : 5);
 
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
 
-      // Ensure row exists (also initialize pricing_version + bootstrap_min defensively)
       await client.query(
         `INSERT INTO account_tokens (user_id, pricing_version, bootstrap_min)
          VALUES ($1, $2, 0)
@@ -38,7 +36,6 @@ export default async function handler(req, res) {
         [uid, PRICING_VERSION]
       );
 
-      // Lock row
       const r = await client.query(
         `SELECT media_balance, media_reserved, pricing_version, bootstrap_min
          FROM account_tokens
@@ -52,7 +49,6 @@ export default async function handler(req, res) {
       let reserved = Number(row.media_reserved || 0) || 0;
       const bootstrapMin = Number(row.bootstrap_min || 0) || 0;
 
-      // OPTIONAL AUTO-HEAL (only keep if reserved is not truly used yet)
       if (!Number.isFinite(reserved) || reserved < 0 || reserved > balance) {
         reserved = 0;
         await client.query(
@@ -63,12 +59,9 @@ export default async function handler(req, res) {
         );
       }
 
-      // ✅ One-time bootstrap / upgrade-only logic:
-      // Only grant if desiredMin exceeds the highest bootstrap we've ever granted.
       if (desiredMin > bootstrapMin) {
         const target = desiredMin;
 
-        // Only top up if current balance is below the new bootstrap target.
         if (balance < target) {
           const delta = target - balance;
 
@@ -99,7 +92,6 @@ export default async function handler(req, res) {
 
           balance = target;
         } else {
-          // Balance already >= target, still record we've upgraded bootstrap_min
           await client.query(
             `UPDATE account_tokens
              SET bootstrap_min = $2,
@@ -110,7 +102,6 @@ export default async function handler(req, res) {
           );
         }
       } else {
-        // Keep pricing_version in sync (optional)
         await client.query(
           `UPDATE account_tokens
            SET pricing_version = $2,
@@ -127,12 +118,15 @@ export default async function handler(req, res) {
       res.setHeader("Cache-Control", "no-store");
       return res.status(200).json({
         ok: true,
+        tokensHydrated: true,
+
         userId: uid,
         provider: providerNorm || null,
         pricingVersion: PRICING_VERSION,
 
         desiredMin,
-        bootstrapMin: Math.max(bootstrapMin, desiredMin), // helpful debug (post-upgrade)
+        bootstrapMin: Math.max(bootstrapMin, desiredMin),
+
         mediaTokens: available,
         mediaTokensBalance: balance,
         mediaTokensReserved: reserved,

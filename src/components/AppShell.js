@@ -16,13 +16,15 @@ export default function AppShell({
 
   onGoogleLogin,
   onLogout,
+
+  onStartCheckout, // ✅ NEW
 }) {
   const { threads, activeId, setActiveId, activeThread, loadingThreads, createThread, creatingThread } = useThreads();
   const [collapsed, setCollapsed] = useState(false);
 
   return (
     <Shell>
-      <Toaster position="bottom-right" richColors/>
+      <Toaster position="bottom-right" richColors />
       <Sidebar
         collapsed={collapsed}
         onToggle={() => setCollapsed((v) => !v)}
@@ -38,6 +40,7 @@ export default function AppShell({
         pendingMediaTokens={pendingMediaTokens}
         onGoogleLogin={onGoogleLogin}
         onLogout={onLogout}
+        onStartCheckout={onStartCheckout} // ✅
       />
 
       <Main>

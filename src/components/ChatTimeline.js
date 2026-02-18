@@ -979,6 +979,107 @@ useEffect(() => {
 }, [items]);
 
 
+function safeFileBaseName(name) {
+  const raw = String(name || "file").trim() || "file";
+  const cleaned = raw
+    .replace(/[\/\\?%*:|"<>]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  // strip a simple extension (".mp4", ".wav", ".m4a", etc.)
+  const noExt = cleaned.replace(/\.[a-z0-9]{1,6}$/i, "").trim();
+  return noExt || "file";
+}
+
+function downloadBlobFile(filename, blob) {
+  if (typeof window === "undefined" || typeof document === "undefined") return;
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+
+function downloadTextFile(filename, text, mime) {
+  const content = String(text || "");
+  const blob = new Blob([content], { type: mime || "text/plain;charset=utf-8" });
+  downloadBlobFile(filename, blob);
+}
+
+async function copyToClipboard(text) {
+  if (typeof window === "undefined" || typeof document === "undefined") return false;
+
+  const s = String(text || "");
+  if (!s.trim()) return false;
+
+  // modern
+  try {
+    if (navigator?.clipboard?.writeText) {
+      await navigator.clipboard.writeText(s);
+      return true;
+    }
+  } catch (e) {}
+
+  // fallback
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = s;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-1000px";
+    ta.style.left = "-1000px";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return !!ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+// ✅ tries to zip many files if jszip exists; else falls back to a single bundle .txt
+async function downloadAllAsZipOrBundle({ zipName, bundleName, files }) {
+  if (typeof window === "undefined") return;
+
+  const cleanFiles = (Array.isArray(files) ? files : [])
+    .map((f) => ({
+      name: String(f?.name || "").trim(),
+      content: String(f?.content || ""),
+    }))
+    .filter((f) => f.name && f.content.trim());
+
+  if (!cleanFiles.length) return;
+
+  // Try JSZip (global or dynamic import)
+  try {
+    const JSZip = window.JSZip || (await import("jszip")).default;
+    if (JSZip) {
+      const zip = new JSZip();
+      for (const f of cleanFiles) zip.file(f.name, f.content);
+      const blob = await zip.generateAsync({ type: "blob" });
+      downloadBlobFile(zipName || "downloads.zip", blob);
+      return;
+    }
+  } catch (e) {
+    // ignore -> fallback
+  }
+
+  // Fallback: one bundle txt
+  const bundled = cleanFiles
+    .map((f) => `===== ${f.name} =====\n${f.content}\n`)
+    .join("\n");
+
+  downloadTextFile(bundleName || "downloads.bundle.txt", bundled, "text/plain;charset=utf-8");
+}
+
+
   useEffect(() => {
   setOptimisticTrSrtByKey((prev) => {
     const next = { ...(prev || {}) };
@@ -1405,6 +1506,10 @@ const showText =
 
         const title = media?.filename || media?.name || (media?.url ? "linked media" : "media");
 
+        const baseName = safeFileBaseName(title || chatItemId);
+
+
+
         const toneT = stateTone(trans);
         const toneTR = stateTone(tr);
         const toneS = stateTone(sum);
@@ -1631,6 +1736,175 @@ const trTargetsAll = uniq(trTargets);
 const trMissingTargets = trTargetsAll.filter((l) => !hasTranslationOutput(l));
 
 
+// ----------------------
+// ✅ TRANSCRIPTION export
+// ----------------------
+const getTranscribeSrtOut = () => {
+  const api = srtEditorRefsRef.current?.[chatItemId];
+  if (api && typeof api.getSrt === "function") return String(api.getSrt() || "");
+  // if server has no raw SRT but we have segments, generate one
+  if (persistedSrt && String(persistedSrt).trim()) return String(persistedSrt);
+  if (Array.isArray(mergedSegs) && mergedSegs.length) return segmentsToSrt(mergedSegs);
+  return "";
+};
+
+const getTranscribeTextOut = () => {
+  // match what user sees in Text view as closely as possible
+  const txt = String(results?.transcript || segPlain || getLiveStreamFor(liveOne?.stream?.transcribe) || "");
+  return txt;
+};
+
+const transcribeHasOut =
+  transView === "srt" ? !!getTranscribeSrtOut().trim() : !!getTranscribeTextOut().trim();
+
+const onDownloadTranscribe = () => {
+  if (transView === "srt") {
+    const srt = getTranscribeSrtOut();
+    if (!srt.trim()) return;
+    downloadTextFile(`${baseName}.srt`, srt, "application/x-subrip;charset=utf-8");
+  } else {
+    const txt = getTranscribeTextOut();
+    if (!txt.trim()) return;
+    downloadTextFile(`${baseName}.txt`, txt, "text/plain;charset=utf-8");
+  }
+};
+
+const onCopyTranscribe = async () => {
+  const payload = transView === "srt" ? getTranscribeSrtOut() : getTranscribeTextOut();
+  await copyToClipboard(payload);
+};
+
+// ----------------------
+// ✅ TRANSLATION export
+// ----------------------
+function extractTranslationForLang(lang) {
+  const l = String(lang || "").trim();
+  if (!l) return { srt: "", text: "" };
+
+  // optimistic per-lang wins
+  const k = trKey(chatItemId, l);
+  const optSrt = String(optimisticTrSrtByKey?.[k] || "").trim();
+  if (optSrt) {
+    const srt = optSrt.endsWith("\n") ? optSrt : optSrt + "\n";
+    const segs = srtToSegments(srt);
+    const text = segs.length ? segmentsToPlainText(segs) : "";
+    return { srt, text };
+  }
+
+  const payload = trMap ? getByLangCI(trMap, l) : null;
+
+  let srt = "";
+  let segs = [];
+  let text = "";
+
+  if (typeof payload === "string") {
+    srt = payload;
+  } else if (Array.isArray(payload)) {
+    segs = payload;
+  } else if (payload && typeof payload === "object") {
+    srt = String(payload?.srt || payload?.translationSrt || "");
+    text = String(payload?.text || payload?.translationText || "");
+    segs =
+      (Array.isArray(payload?.segments) && payload.segments) ||
+      (Array.isArray(payload?.translationSegments) && payload.translationSegments) ||
+      [];
+  }
+
+  srt = String(srt || "").trim();
+  text = String(text || "").trim();
+
+  if (!segs.length && srt) segs = srtToSegments(srt);
+  if (!text && segs.length) text = segmentsToPlainText(segs);
+  if (!srt && segs.length) srt = segmentsToSrt(segs);
+
+  if (srt && !srt.endsWith("\n")) srt += "\n";
+  return { srt, text };
+}
+
+const getTranslateSrtOut = () => {
+  const api = trSrtEditorRefsRef.current?.[chatItemId];
+  if (api && typeof api.getSrt === "function") return String(api.getSrt() || "");
+  if (persistedTrSrt && String(persistedTrSrt).trim()) return String(persistedTrSrt);
+  if (Array.isArray(mergedTranslateSegs) && mergedTranslateSegs.length) return segmentsToSrt(mergedTranslateSegs);
+  return "";
+};
+
+const getTranslateTextOut = () => {
+  return String(mergedTranslateText || translateStream || "");
+};
+
+const translateHasOut =
+  trView === "srt" ? !!getTranslateSrtOut().trim() : !!getTranslateTextOut().trim();
+
+const onDownloadTranslateOne = () => {
+  const lang = String(selectedTrLang || "").trim();
+  if (!lang) return;
+
+  if (trView === "srt") {
+    const srt = getTranslateSrtOut();
+    if (!srt.trim()) return;
+    downloadTextFile(`${baseName}.${lang}.srt`, srt, "application/x-subrip;charset=utf-8");
+  } else {
+    const txt = getTranslateTextOut();
+    if (!txt.trim()) return;
+    downloadTextFile(`${baseName}.${lang}.txt`, txt, "text/plain;charset=utf-8");
+  }
+};
+
+const onCopyTranslate = async () => {
+  const payload = trView === "srt" ? getTranslateSrtOut() : getTranslateTextOut();
+  await copyToClipboard(payload);
+};
+
+// ✅ Download-all languages that actually have output
+const trLangsForDownloadAll = (Array.isArray(trSelectableLangs) ? trSelectableLangs : []).filter((l) => {
+  const lang = String(l || "").trim();
+  if (!lang) return false;
+
+  const k = trKey(chatItemId, lang);
+  const opt = String(optimisticTrSrtByKey?.[k] || "").trim();
+  if (opt) return true;
+
+  const payload = trMap ? getByLangCI(trMap, lang) : null;
+  return hasTranslationContent(payload);
+});
+
+const onDownloadTranslateAll = async () => {
+  const ext = trView === "text" ? "txt" : "srt";
+  const files = trLangsForDownloadAll
+    .map((lang) => {
+      const out = extractTranslationForLang(lang);
+      const content = trView === "text" ? out.text : out.srt;
+      return {
+        name: `${baseName}.${lang}.${ext}`,
+        content,
+      };
+    })
+    .filter((f) => String(f.content || "").trim());
+
+  if (!files.length) return;
+
+  await downloadAllAsZipOrBundle({
+    zipName: `${baseName}.translations.${ext}.zip`,
+    bundleName: `${baseName}.translations.${ext}.bundle.txt`,
+    files,
+  });
+};
+
+// ----------------------
+// ✅ SUMMARY export
+// ----------------------
+const summaryTextOut = String(results?.summary || getLiveStreamFor(liveOne?.stream?.summarize) || "");
+const summaryHasOut = !!summaryTextOut.trim();
+
+const onDownloadSummary = () => {
+  if (!summaryTextOut.trim()) return;
+  downloadTextFile(`${baseName}.summary.txt`, summaryTextOut, "text/plain;charset=utf-8");
+};
+
+const onCopySummary = async () => {
+  await copyToClipboard(summaryTextOut);
+};
 
 
 
@@ -2260,17 +2534,36 @@ if (tab === "transcribe") {
 
                     {tab === "transcribe" ? (
   <HdrRight>
-    {/* existing transcription controls */}
-    {transView === "srt" ? (
-      <HdrActions>
-        <HdrBtn type="button" onClick={doReset} disabled={!canReset} title="Discard local edits">
-          Reset
-        </HdrBtn>
-        <HdrBtn type="button" onClick={doSave} disabled={!canSave} title="Save SRT edits">
-          Save
-        </HdrBtn>
-      </HdrActions>
-    ) : null}
+    <HdrActions>
+      <HdrBtn
+        type="button"
+        onClick={onDownloadTranscribe}
+        disabled={!transcribeHasOut}
+        title={transView === "srt" ? "Download transcription .srt" : "Download transcription .txt"}
+      >
+        {transView === "srt" ? "Download SRT" : "Download TXT"}
+      </HdrBtn>
+
+      <HdrBtn
+        type="button"
+        onClick={onCopyTranscribe}
+        disabled={!transcribeHasOut}
+        title="Copy to clipboard"
+      >
+        Copy
+      </HdrBtn>
+
+      {transView === "srt" ? (
+        <>
+          <HdrBtn type="button" onClick={doReset} disabled={!canReset} title="Discard local edits">
+            Reset
+          </HdrBtn>
+          <HdrBtn type="button" onClick={doSave} disabled={!canSave} title="Save SRT edits">
+            Save
+          </HdrBtn>
+        </>
+      ) : null}
+    </HdrActions>
 
     <Switch>
       <SwitchBtn
@@ -2291,59 +2584,88 @@ if (tab === "transcribe") {
   </HdrRight>
 ) : tab === "translate" ? (
   <HdrRight>
-    {trView === "srt" ? (
-  <HdrActions>
-    <HdrBtn type="button" onClick={doTrReset} disabled={!canTrReset} title="Discard local translation edits">
-      Reset
-    </HdrBtn>
-    <HdrBtn type="button" onClick={doTrSave} disabled={!canTrSave} title="Save translated SRT edits">
-      Save
-    </HdrBtn>
-  </HdrActions>
-) : null}
+    <HdrActions>
+      <HdrBtn
+        type="button"
+        onClick={onDownloadTranslateOne}
+        disabled={!translateHasOut || !String(selectedTrLang || "").trim()}
+        title={trView === "srt" ? "Download selected translation .srt" : "Download selected translation .txt"}
+      >
+        {trView === "srt" ? "Download SRT" : "Download TXT"}
+      </HdrBtn>
 
-<TranslateLangSelect
-  value={selectedTrLang}
-  disabled={!trSelectableLangs.length}
-  onChange={(e) => {
-    const v = String(e?.target?.value || "");
-    setTrLangByItem((p) => ({ ...(p || {}), [chatItemId]: v }));
-  }}
-  title="Choose translation language"
->
-  <option value="">
-    {trSelectableLangs.length ? "Select language…" : "No translation targets"}
-  </option>
+      <HdrBtn
+        type="button"
+        onClick={onDownloadTranslateAll}
+        disabled={!trLangsForDownloadAll.length}
+        title={
+          trView === "srt"
+            ? "Download ALL translations as .srt (zip if available)"
+            : "Download ALL translations as .txt (zip if available)"
+        }
+      >
+        Download all
+      </HdrBtn>
 
-{trSelectableLangs.map((l) => {
-  const st = getStepForLang(tr, l);
-  const stage = deriveStage(st, "translate");
-  const busy = isBusy(st);
+      <HdrBtn
+        type="button"
+        onClick={onCopyTranslate}
+        disabled={!translateHasOut}
+        title="Copy to clipboard"
+      >
+        Copy
+      </HdrBtn>
 
-  const payload = trMap ? getByLangCI(trMap, l) : null;
-  const hasOut = hasTranslationContent(payload);
+      {trView === "srt" ? (
+        <>
+          <HdrBtn type="button" onClick={doTrReset} disabled={!canTrReset} title="Discard local translation edits">
+            Reset
+          </HdrBtn>
+          <HdrBtn type="button" onClick={doTrSave} disabled={!canTrSave} title="Save translated SRT edits">
+            Save
+          </HdrBtn>
+        </>
+      ) : null}
+    </HdrActions>
 
-  let label = l;
+    <TranslateLangSelect
+      value={selectedTrLang}
+      disabled={!trSelectableLangs.length}
+      onChange={(e) => {
+        const v = String(e?.target?.value || "");
+        setTrLangByItem((p) => ({ ...(p || {}), [chatItemId]: v }));
+      }}
+      title="Choose translation language"
+    >
+      <option value="">
+        {trSelectableLangs.length ? "Select language…" : "No translation targets"}
+      </option>
 
-  if (busy) {
-    label = stage && stage !== "—" ? `${l} • ${stage}` : `${l} • translating`;
-  } else if (!hasOut) {
-    // ✅ key UX improvement
-    label = `${l} • not translated`;
-  } else if (stage && stage !== "—") {
-    label = `${l} • ${stage}`;
-  }
+      {trSelectableLangs.map((l) => {
+        const st = getStepForLang(tr, l);
+        const stage = deriveStage(st, "translate");
+        const busy = isBusy(st);
 
-  return (
-    <option key={l} value={l}>
-      {label}
-    </option>
-  );
-})}
+        const payload = trMap ? getByLangCI(trMap, l) : null;
+        const hasOut = hasTranslationContent(payload);
 
-</TranslateLangSelect>
+        let label = l;
 
+        if (busy) {
+          label = stage && stage !== "—" ? `${l} • ${stage}` : `${l} • translating`;
+        } else if (!hasOut) {
+          label = `${l} • not translated`;
+        } else if (stage && stage !== "—") {
+          label = `${l} • ${stage}`;
+        }
 
+        return (
+          <option key={l} value={l}>
+            {label}
+          </option>
+        );
+      })}
+    </TranslateLangSelect>
 
     <Switch>
       <SwitchBtn
@@ -2362,7 +2684,30 @@ if (tab === "transcribe") {
       </SwitchBtn>
     </Switch>
   </HdrRight>
-) : null}
+) : (
+  <HdrRight>
+    <HdrActions>
+      <HdrBtn
+        type="button"
+        onClick={onDownloadSummary}
+        disabled={!summaryHasOut}
+        title="Download summary .txt"
+      >
+        Download TXT
+      </HdrBtn>
+
+      <HdrBtn
+        type="button"
+        onClick={onCopySummary}
+        disabled={!summaryHasOut}
+        title="Copy to clipboard"
+      >
+        Copy
+      </HdrBtn>
+    </HdrActions>
+  </HdrRight>
+)}
+
 
                   </OutputHead>
 

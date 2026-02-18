@@ -420,11 +420,20 @@ const LegacySrtSegmentsEditor = forwardRef(function LegacySrtSegmentsEditor(
     onSave({ transcriptSrt, transcriptText });
   };
 
-  useImperativeHandle(ref, () => ({
-    reset,
-    save,
-    getMeta: () => computeMeta(items),
-  }));
+useImperativeHandle(ref, () => ({
+  reset,
+  save,
+  getMeta: () => computeMeta(items),
+
+  // ✅ NEW: export current editor state (includes unsaved edits)
+  getSrt: () => buildSrtFromItems(items),
+  getText: () => {
+    const segs = itemsToSegments(items);
+    return segmentsToPlainText(segs);
+  },
+  getSegments: () => itemsToSegments(items),
+}));
+
 
   if (!items.length) {
     return (
