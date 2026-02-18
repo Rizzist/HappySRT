@@ -1,3 +1,4 @@
+import Head from "next/head";
 import { AuthProvider } from "../contexts/AuthContext";
 import { ThreadsProvider } from "@/contexts/threadsContext";
 import { FfmpegProvider } from "../contexts/FfmpegContext";
@@ -31,6 +32,9 @@ export default function App({ Component, pageProps }) {
       <FfmpegProvider>
         <ThreadsProvider>
           <GlobalStyle />
+            <Head>
+            <link rel="icon" href="/favicon.ico" sizes="any" />
+          </Head>
           <Component {...pageProps} />
         </ThreadsProvider>
       </FfmpegProvider>
