@@ -25,6 +25,9 @@ const { DEFAULTS: TR_DEFAULTS, getModels: getTrModels, getSourceLanguages, getTa
 import * as TrBillImport from "../shared/translationBillingCatalog";
 const TrBill = (TrBillImport && (TrBillImport.default || TrBillImport)) || {};
 
+import * as SumBillImport from "../shared/summarizationBillingCatalog";
+const SumBill = (SumBillImport && (SumBillImport.default || SumBillImport)) || {};
+
 function normalizeWhitespace(t) {
   return String(t || "")
     .replace(/\s+/g, " ")
@@ -776,18 +779,18 @@ function TranslateSelectionGuard({ chatItemId, explicitLang, validLangs, clearSe
 
 
 // ======================
-// ✅ SUMMARY ESTIMATION HELPERS
+// ✅ SUMMARY ESTIMATION HELPERS (deterministic + ThreadComposer-aligned)
 // ======================
 
 function estimateTokensForTextLoose(text) {
-  // very safe fallback heuristic: ~1 token ≈ 4 chars
+  // safe fallback heuristic: ~1 token ≈ 4 chars
   const s = String(text || "");
   const chars = s.length;
   if (!chars) return 0;
   return Math.max(1, Math.ceil(chars / 4));
 }
 
-function estimateSummaryClientTokens({ inputText, modelId }) {
+function estimateSummaryTokensFallback({ inputText } = {}) {
   const inTok = estimateTokensForTextLoose(inputText);
 
   // output heuristic: ~20% of input + fixed, capped
@@ -796,20 +799,32 @@ function estimateSummaryClientTokens({ inputText, modelId }) {
   // overhead (system/tooling)
   const overhead = 80;
 
-  // If you ever add a real estimator in Billing, use it when available
-  // (don’t assume; only call if present)
-  if (Billing && typeof Billing.estimateSummaryTokens === "function") {
-    try {
-      const n = Billing.estimateSummaryTokens(String(inputText || ""), String(modelId || ""), null);
-      const x = Number(n);
-      if (Number.isFinite(x) && x >= 0) return Math.round(x);
-    } catch {}
-  }
-
   return Math.max(0, Math.round(inTok + outTok + overhead));
 }
 
-function getSummaryCostDisplay({ it, liveOne, sum, inputText, modelId }) {
+// ✅ deterministic estimator (same method as ThreadComposer)
+function estimateSummarizeRunTokensDeterministic({ inputText, modelId, language } = {}) {
+  const text = String(inputText || "").trim();
+  if (!text) return 0;
+
+  if (SumBill && typeof SumBill.estimateSummarizationRun === "function") {
+    try {
+      const opts = {};
+      if (modelId) opts.modelId = String(modelId);
+      // only pass language if your billing estimator supports it (harmless if ignored)
+      if (language && String(language).trim()) opts.language = String(language);
+
+      const run = SumBill.estimateSummarizationRun({ text }, opts);
+      const n = Number(run?.mediaTokens || 0) || 0;
+      return Math.max(0, Math.round(n));
+    } catch {}
+  }
+
+  return estimateSummaryTokensFallback({ inputText: text });
+}
+
+function getSummaryCostDisplay({ it, liveOne, sum, inputText, modelId, language }) {
+  // actual tokens (prefer actual)
   const costRaw =
     sum?.actualTokensUsed ??
     sum?.costTokens ??
@@ -824,6 +839,7 @@ function getSummaryCostDisplay({ it, liveOne, sum, inputText, modelId }) {
   const hasCost = costRaw != null && String(costRaw) !== "";
   const costTokens = Math.max(0, Number(costRaw || 0) || 0);
 
+  // potential/estimated tokens (server-side “expected”)
   const potentialRaw =
     sum?.potentialTokens ??
     sum?.estimatedTokens ??
@@ -836,10 +852,16 @@ function getSummaryCostDisplay({ it, liveOne, sum, inputText, modelId }) {
   const hasPotential = potentialRaw != null && String(potentialRaw) !== "";
   const potentialTokens = Math.max(0, Number(potentialRaw || 0) || 0);
 
-  const clientTokens = !hasCost && !hasPotential ? estimateSummaryClientTokens({ inputText, modelId }) : 0;
+  // ✅ deterministic estimate when server didn’t provide anything yet
+  const clientTokens =
+    !hasCost && !hasPotential
+      ? estimateSummarizeRunTokensDeterministic({ inputText, modelId, language })
+      : 0;
 
   const kind = hasCost ? "actual" : hasPotential ? "potential" : clientTokens > 0 ? "client" : "unknown";
-  const tokens = kind === "actual" ? costTokens : kind === "potential" ? potentialTokens : kind === "client" ? clientTokens : null;
+
+  const tokens =
+    kind === "actual" ? costTokens : kind === "potential" ? potentialTokens : kind === "client" ? clientTokens : null;
 
   const usd = tokens != null && typeof tokensToUsd === "function" ? Number(tokensToUsd(tokens) || 0) : null;
 
@@ -857,8 +879,9 @@ function getSummaryCostDisplay({ it, liveOne, sum, inputText, modelId }) {
 
 
 
+
 export default function ChatTimeline({ thread, showEmpty = true }) {
-  const { liveRunsByThread, retryTranscribe, retryTranslate, saveSrt, saveTranslationSrt } = useThreads();
+  const { liveRunsByThread, retryTranscribe, retryTranslate, retrySummarize, saveSrt, saveTranslationSrt } = useThreads();
 
 
   const [trViewByItem, setTrViewByItem] = useState({});
@@ -868,13 +891,14 @@ const trSrtEditorRefsRef = useRef({});
 const [trSrtMetaByKey, setTrSrtMetaByKey] = useState({});
 const [optimisticTrSrtByKey, setOptimisticTrSrtByKey] = useState({});
 
+const [sumOptsByItem, setSumOptsByItem] = useState({});
 
   const [tabByItem, setTabByItem] = useState({});
   const [transViewByItem, setTransViewByItem] = useState({});
   const [timeByItem, setTimeByItem] = useState({});
 
-  // shape: { chatItemId, kind: "transcribe" | "translate" }
-  const [openMenu, setOpenMenu] = useState(null);
+// shape: { chatItemId, kind: "transcribe" | "translate" | "summarize" }
+const [openMenu, setOpenMenu] = useState(null);
 
   const anchorElRef = useRef(null);
   const menuElRef = useRef(null);
@@ -891,7 +915,7 @@ const [optimisticTrSrtByKey, setOptimisticTrSrtByKey] = useState({});
   const [optimisticSrtByItem, setOptimisticSrtByItem] = useState({});
 
   // ✅ token gating for client-side actions
-  const { tokenSnapshot, mediaTokens, pendingMediaTokens } = useAuth();
+  const { tokenSnapshot, mediaTokens, pendingMediaTokens, reserveMediaTokens } = useAuth();
 
   // ✅ unused = availableRaw - optimisticEffective (capped)
   const availableUnused = useMemo(() => {
@@ -1155,6 +1179,9 @@ useEffect(() => {
         const tr = status?.translate || {};
         const sum = status?.summarize || {};
 
+      
+
+
         const transState = String(trans?.state || "");
         const isTranscribing = transState === "running" || transState === "queued";
 
@@ -1208,6 +1235,83 @@ const selectedTrLang =
   trCompletedLangs[0] ||
   trSelectableLangs[0] ||
   "";
+
+
+// ======================
+// ✅ SUMMARY (estimate + actual + rerun gating)
+// ======================
+
+// seed settings (ThreadComposer-aligned)
+const sumSeed = {
+  modelId: String(sum?.modelId || it?.options?.summarize?.modelId || TR_DEFAULTS?.modelId || "gpt-4o-mini"),
+  language: String(sum?.language || it?.options?.summarize?.language || it?.options?.summarize?.lang || "auto") || "auto",
+};
+
+const sumOpts = sumOptsByItem?.[chatItemId] || sumSeed;
+const sumModelId = String(sumOpts?.modelId || sumSeed.modelId || "gpt-4o-mini");
+const sumLang = String(sumOpts?.language || sumSeed.language || "auto") || "auto";
+
+// best input text to summarize (prefer transcript)
+const summaryInputText =
+  normalizeWhitespace(results?.transcript || segPlain || getLiveStreamFor(liveOne?.stream?.transcribe) || "");
+
+// display object (actual wins; else server potential; else deterministic client estimate)
+const sumDisp = getSummaryCostDisplay({
+  it,
+  liveOne,
+  sum,
+  inputText: summaryInputText,
+  modelId: sumModelId,
+  language: sumLang,
+});
+
+const sumTokens = sumDisp.tokens;
+const sumUsd = sumDisp.usd;
+const sumIsBusy = isBusy(sum);
+
+// ✅ rerun estimate ALWAYS computed from current UI settings (like transcribe rerunTokens)
+const sumRerunTokens =
+  summaryInputText
+    ? estimateSummarizeRunTokensDeterministic({ inputText: summaryInputText, modelId: sumModelId, language: sumLang })
+    : null;
+
+const sumRerunUsd =
+  sumRerunTokens != null && typeof tokensToUsd === "function" ? Number(tokensToUsd(sumRerunTokens) || 0) : null;
+
+const sumRerunAffordable = sumRerunTokens == null ? true : sumRerunTokens <= availableUnused;
+
+// used for “can click rerun”
+const sumCanRerun = !sumIsBusy && sumRerunAffordable;
+
+let sumPillState =
+  sumDisp.kind === "potential" || sumDisp.kind === "client"
+    ? "potential"
+    : sumIsBusy
+    ? "pending"
+    : normalizeStepState(sum?.state) === "failed"
+    ? "failed"
+    : normalizeStepState(sum?.state) === "done"
+    ? "done"
+    : "idle";
+
+// ✅ optional: show red if estimate exists but you can’t afford rerun
+if (!sumIsBusy && sumDisp.kind !== "actual" && sumRerunTokens != null && !sumRerunAffordable) {
+  sumPillState = "failed";
+}
+
+const sumPillTitle =
+  sumDisp.kind === "unknown"
+    ? `No estimate yet • ${sumModelId} • ${sumLang}`
+    : [
+        sumDisp.title,
+        sumUsd != null ? `(~$${sumUsd.toFixed(2)})` : null,
+        `Lang: ${sumLang}`,
+        `Model: ${sumModelId}`,
+        sumRerunTokens != null ? `Rerun: ~${sumRerunTokens} tok${sumRerunUsd != null ? ` (~$${sumRerunUsd.toFixed(2)})` : ""}` : null,
+        sumRerunTokens != null ? `Have unused: ${availableUnused}` : null,
+      ]
+        .filter(Boolean)
+        .join(" • ");
 
 
 
@@ -1696,6 +1800,69 @@ if (need > 0 && need > availableUnused) {
           closeMenu();
         };
 
+        const isSummarizeMenuOpen = openMenu && openMenu.chatItemId === chatItemId && openMenu.kind === "summarize";
+
+const openSummarizeMenu = (e) => {
+  if (!isBrowser) return;
+  const el = e?.currentTarget;
+  if (!el) return;
+
+  setSumOptsByItem((p) => {
+    const cur = p?.[chatItemId];
+    if (cur) return p || {};
+    return { ...(p || {}), [chatItemId]: sumSeed };
+  });
+
+  if (isSummarizeMenuOpen) {
+    closeMenu();
+    return;
+  }
+
+  anchorElRef.current = el;
+  setOpenMenu({ chatItemId, kind: "summarize" });
+};
+
+const doReSummarize = () => {
+  setTabByItem((p) => ({ ...(p || {}), [chatItemId]: "summarize" }));
+
+  const need = sumRerunTokens != null ? Math.max(0, Number(sumRerunTokens || 0) || 0) : 0;
+
+  if (need > 0 && need > availableUnused) {
+    toast.error(`Not enough media tokens to summarize. Need ~${need}, have ${availableUnused}.`);
+    closeMenu();
+    return;
+  }
+console.log("SUM CLICK", {
+  chatItemId,
+  sumModelId,
+  sumLang,
+  sumOpts: sumOptsByItem?.[chatItemId],
+});
+  if (typeof retrySummarize === "function") {
+    retrySummarize({
+      chatItemId,
+      options: {
+        force: true,
+        clearSummary: true,
+        clearSummarize: true,
+        doSummarize: true,
+        summarize: {
+          enabled: true,
+          modelId: sumModelId,
+          language: sumLang,     // ✅ UI language setting
+          lang: sumLang,         // ✅ extra alias (server can ignore)
+        },
+      },
+    });
+  } else {
+    toast.error("Summarize action is not wired (retrySummarize missing).");
+  }
+
+  closeMenu();
+};
+
+
+
         const outputHeaderLabel =
           tab === "transcribe" ? (transView === "srt" ? "SRT" : "Text") : tab === "translate" ? "Translation" : "Summary";
 
@@ -2005,11 +2172,31 @@ if (tab === "transcribe") {
                 </StepBtn>
 
 
-                <StepPill $tone={toneS} title="Summary">
-                  <Dot $tone={toneS} />
-                  <StepK> S </StepK>
-                  <StepV>{deriveStage(sum, "summarize")}</StepV>
-                </StepPill>
+<StepBtn
+  type="button"
+  $tone={toneS}
+  onClick={openSummarizeMenu}
+  $open={!!isSummarizeMenuOpen}
+  title="Summary options"
+>
+  <Dot $tone={toneS} />
+  <StepK> S </StepK>
+  <StepV>{deriveStage(sum, "summarize")}</StepV>
+
+<CostPill
+  $state={sumPillState}
+  title={sumPillTitle}
+>
+  {sumTokens != null
+    ? `${sumDisp.kind === "actual" ? "" : "~"}${formatCompact(sumTokens)} tok`
+    : "— tok"}
+</CostPill>
+
+
+  {sumIsBusy ? <Spinner /> : null}
+  <Caret $open={!!isSummarizeMenuOpen}>▾</Caret>
+</StepBtn>
+
 
                 {isFailed(trans) && trans?.error ? <Err title={String(trans.error)}>{String(trans.error)}</Err> : null}
               </HeadRight>
@@ -2318,7 +2505,7 @@ if (tab === "transcribe") {
                         Re-transcribe will retry if it failed/queued, or re-run after done — always using the language/model selected above.
                       </MenuNote>
                     </Menu>
-                  ) : (
+                  ) : openMenu.kind === "translate" ? (
   <Menu
     ref={menuElRef}
     style={{
@@ -2494,7 +2681,130 @@ if (tab === "transcribe") {
                       <MenuNote>Translate runs for this chat item only, using the settings above.</MenuNote>
 
                     </Menu>
-                  ),
+                  ) : (
+  /* ✅ NEW summarize menu */
+  <Menu
+    ref={menuElRef}
+    style={{
+      position: "fixed",
+      top: menuPos.top,
+      left: menuPos.left,
+      width: menuPos.width,
+      maxHeight: `calc(100vh - ${Math.max(12, menuPos.top)}px - 12px)`,
+      overflow: "auto",
+    }}
+    role="dialog"
+    aria-label="Summary options"
+  >
+    <MenuTop>
+      <MenuTitle>Summary</MenuTitle>
+      <MenuStatus>
+        <Dot $tone={toneS} />
+        <MenuStatusText>{deriveStage(sum, "summarize")}</MenuStatusText>
+      </MenuStatus>
+    </MenuTop>
+
+   <MenuRow>
+  <MenuAction
+    type="button"
+    onClick={doReSummarize}
+    disabled={sumIsBusy || !sumRerunAffordable}
+    title={
+      sumIsBusy
+        ? "Summarization is running"
+        : !sumRerunAffordable
+        ? `Not enough media tokens (need ~${sumRerunTokens}, have ${availableUnused})`
+        : `Re-summarize using ${sumModelId} • ${sumLang}`
+    }
+  >
+    {String(sum?.state || "") === "failed" ? "Retry summarize" : "Re-summarize"}
+  </MenuAction>
+
+  <MenuEstimatePill
+    $state={sumRerunTokens == null ? "unknown" : sumRerunAffordable ? "potential" : "failed"}
+    title={
+      sumRerunTokens == null
+        ? "No estimate yet"
+        : [
+            `Estimated re-summarize: ~${sumRerunTokens} tokens`,
+            sumRerunUsd != null ? `(~$${sumRerunUsd.toFixed(2)})` : null,
+            `Have unused: ${availableUnused}`,
+            `Lang: ${sumLang}`,
+            `Model: ${sumModelId}`,
+          ]
+            .filter(Boolean)
+            .join(" • ")
+    }
+  >
+    {sumRerunTokens == null ? "—" : `~${formatCompact(sumRerunTokens)} tok`}
+  </MenuEstimatePill>
+</MenuRow>
+
+
+    <MenuDivider />
+
+    <MenuField>
+      <MenuLabel>Model</MenuLabel>
+      <MenuSelect
+        value={String(sumModelId)}
+        onChange={(e) => {
+          const v = String(e?.target?.value || "gpt-4o-mini") || "gpt-4o-mini";
+          setSumOptsByItem((p) => ({
+            ...(p || {}),
+            [chatItemId]: { ...(p?.[chatItemId] || sumSeed), modelId: v },
+          }));
+        }}
+      >
+        {(trModelOptions.length ? trModelOptions : [{ id: "gpt-4o-mini", label: "GPT-4o mini" }]).map((m) => (
+          <option key={String(m.id)} value={String(m.id)}>
+            {String(m.label || m.id)}
+          </option>
+        ))}
+      </MenuSelect>
+    </MenuField>
+    <MenuDivider />
+
+<MenuField>
+  <MenuLabel>Language</MenuLabel>
+
+  {languageOptions.length ? (
+    <MenuSelect
+      value={String(sumLang || "auto")}
+      onChange={(e) => {
+        const v = String(e?.target?.value || "auto") || "auto";
+        setSumOptsByItem((p) => ({
+          ...(p || {}),
+          [chatItemId]: { ...(p?.[chatItemId] || sumSeed), language: v },
+        }));
+      }}
+    >
+      {languageOptions.map((l) => (
+        <option key={String(l.value)} value={String(l.value)}>
+          {String(l.label || l.value)}
+        </option>
+      ))}
+    </MenuSelect>
+  ) : (
+    <MenuInput
+      value={String(sumLang || "")}
+      onChange={(e) => {
+        const v = e?.target?.value;
+        setSumOptsByItem((p) => ({
+          ...(p || {}),
+          [chatItemId]: { ...(p?.[chatItemId] || sumSeed), language: String(v || "") },
+        }));
+      }}
+      placeholder="e.g. auto, en, en-GB, ar..."
+    />
+  )}
+</MenuField>
+
+
+<MenuNote>
+  Re-summarize runs for this chat item only, using the language/model above. Cost shown is an estimate unless actual tokens are present.
+</MenuNote>
+  </Menu>
+),
                   document.body
                 )
               : null}

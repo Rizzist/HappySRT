@@ -11,6 +11,7 @@ import * as BillingImport from "../shared/billingCatalog";
 import * as TranslationImport from "../shared/translationCatalog";
 import * as TrBillingImport from "../shared/translationBillingCatalog";
 import * as SummarizationImport from "../shared/summarizationCatalog";
+import * as SumBillingImport from "../shared/summarizationBillingCatalog";
 
 const TrBilling = (TrBillingImport && (TrBillingImport.default || TrBillingImport)) || {};
 const {
@@ -50,6 +51,7 @@ const { estimateTokensForRun, tokensToUsd, PRICING_VERSION } = Billing;
 const Catalog = (CatalogImport && (CatalogImport.default || CatalogImport)) || {};
 const { LANGUAGES, getModelsForLanguage, getModelById } = Catalog;
 
+const SumBilling = (SumBillingImport && (SumBillingImport.default || SumBillingImport)) || {};
 
 
 function ensureDraftShape(d) {
@@ -661,6 +663,49 @@ const translationEstimate = useMemo(() => {
 }, [doTranslate, readyFiles, trTargetLangs, durationsByItemId]);
 
 
+// ✅ Summarization estimate (shared deterministic; duration fallback)
+const summarizationEstimate = useMemo(() => {
+  if (!doSummarize) {
+    return { ok: true, mediaTokens: 0, usdCents: 0, unknown: 0 };
+  }
+
+  if (typeof SumBilling?.estimateSummarizationRunFromDurationSeconds !== "function") {
+    return { ok: false, mediaTokens: null, usdCents: null, unknown: readyFiles.length };
+  }
+
+  let unknown = 0;
+  let mediaTokensTotal = 0;
+  let usdCentsTotal = 0;
+
+  for (const f of readyFiles) {
+    const itemId = String(f?.itemId || "");
+    const d1 = durationSecondsFromDraftFile(f);
+    const d2 = itemId ? safeFiniteSeconds(durationsByItemId?.[itemId]) : null;
+    const sec = d1 != null ? d1 : d2;
+
+    if (sec == null) {
+      unknown += 1;
+      continue;
+    }
+
+    const run = SumBilling.estimateSummarizationRunFromDurationSeconds(sec, null);
+    mediaTokensTotal += Math.max(0, Number(run?.mediaTokens || 0) || 0);
+    usdCentsTotal += Math.max(0, Number(run?.usdCents || 0) || 0);
+  }
+
+  if (unknown) {
+    return { ok: false, mediaTokens: null, usdCents: null, unknown };
+  }
+
+  return {
+    ok: true,
+    unknown: 0,
+    mediaTokens: mediaTokensTotal,
+    usdCents: usdCentsTotal,
+  };
+}, [doSummarize, readyFiles, durationsByItemId]);
+
+
 
 const transcribeMini = useMemo(() => {
   if (!doTranscribe || !hasReadyMedia) return { show: false };
@@ -694,9 +739,50 @@ const translateMini = useMemo(() => {
   return { show: true, state: "ok", text: formatCompact(need), title };
 }, [doTranslate, hasReadyMedia, translationEstimate, trTargetLangs, formatUsdFromCents]);
 
+const summarizeMini = useMemo(() => {
+  if (!doSummarize || !hasReadyMedia) return { show: false };
+ if (!summarizationEstimate?.ok) {
+    const title =
+      summarizationEstimate?.unknown
+        ? `Missing duration on ${summarizationEstimate.unknown} file(s) — can’t estimate summarization.`
+        : "Can’t estimate summarization.";
+    return { show: true, state: "unknown", text: "—", title };
+  }
+
+  const need = Number(summarizationEstimate.mediaTokens || 0) || 0;
+  const usd = Number(summarizationEstimate.usdCents || 0) || 0;
+  const title = [
+    `Est. summarization: ${need} media tokens`,
+    typeof formatUsdFromCents === "function" ? `(~${formatUsdFromCents(usd)})` : null,
+    sumTargetLang ? `Target: ${String(sumTargetLang)}` : null,
+  ]
+    .filter(Boolean)
+    .join(" • ");
+
+  return { show: true, state: "ok", text: formatCompact(need), title };
+}, [doSummarize, hasReadyMedia, summarizationEstimate, sumTargetLang, formatUsdFromCents]);
+
 
   const availableTokens = Number(mediaTokens || 0) || 0;
-  const overLimit = Boolean(doTranscribe && billingEstimate?.ok && billingEstimate.tokens > availableTokens);
+  // ✅ Gate on total estimated media tokens across selected steps (only when all selected estimates are known)
+  const totalNeed = useMemo(() => {
+    let sum = 0;
+    if (doTranscribe) {
+      if (!billingEstimate?.ok) return null;
+      sum += Number(billingEstimate.tokens || 0) || 0;
+    }
+    if (doTranslate) {
+      if (!translationEstimate?.ok) return null;
+      sum += Number(translationEstimate.mediaTokens || 0) || 0;
+    }
+    if (doSummarize) {
+      if (!summarizationEstimate?.ok) return null;
+      sum += Number(summarizationEstimate.mediaTokens || 0) || 0;
+    }
+    return sum;
+  }, [doTranscribe, doTranslate, doSummarize, billingEstimate, translationEstimate, summarizationEstimate]);
+
+  const overLimit = totalNeed != null && totalNeed > availableTokens;
 
   // Minimal badge shown next to "Summarization" pill (right after it)
  const totalBadge = useMemo(() => {
@@ -723,44 +809,51 @@ const translateMini = useMemo(() => {
     parts.push({ label: "Translation", ok: translationEstimate?.ok, need: tlNeed });
   }
 
+  // summarization
+  let suOk = true;
+  let suNeed = 0;
+  if (doSummarize) {
+    if (!summarizationEstimate?.ok) suOk = false;
+    else suNeed = Number(summarizationEstimate.mediaTokens || 0) || 0;
+    parts.push({ label: "Summarization", ok: summarizationEstimate?.ok, need: suNeed });
+  }
+
   // If neither is on, hide.
   if (!parts.length) return { show: false };
 
-  const ok = trOk && tlOk;
+  const ok = trOk && tlOk && suOk;
   if (!ok) {
     const unknownCount =
-      (billingEstimate?.ok ? 0 : Number(billingEstimate?.unknown || 0) || 0) +
-      (translationEstimate?.ok ? 0 : Number(translationEstimate?.unknown || 0) || 0);
+      (doTranscribe && !billingEstimate?.ok ? (Number(billingEstimate?.unknown || 0) || 1) : 0) +
+      (doTranslate && !translationEstimate?.ok ? (Number(translationEstimate?.unknown || 0) || 1) : 0) +
+      (doSummarize && !summarizationEstimate?.ok ? (Number(summarizationEstimate?.unknown || 0) || 1) : 0);
 
     return {
       show: true,
       state: "unknown",
       text: "—",
       title: unknownCount ? `Missing duration on ${unknownCount} file(s) — can’t estimate total.` : "Can’t estimate total.",
-      totalNeed: null,
-      ok: false,
     };
   }
 
-  const totalNeed = trNeed + tlNeed;
-  const text = `${formatCompact(totalNeed)}/${formatCompact(availableTokens)}`;
 
-  const breakdown = parts
+  const need = parts.reduce((a, p) => a + (Number(p?.need || 0) || 0), 0);
+  const title = parts
     .map((p) => `${p.label}: ${Number(p.need || 0) || 0}`)
     .join(" • ");
 
-  const title = [
-    `Total est.: ${totalNeed} tokens`,
-    breakdown,
-    `Available: ${availableTokens}`,
-    totalNeed > availableTokens ? `Short: ${totalNeed - availableTokens}` : "Sufficient",
-  ]
-    .filter(Boolean)
-    .join(" • ");
+  return { show: true, state: "ok", text: formatCompact(need), title: `Total est.: ${need} media tokens • ${title}` };
+ 
 
-  return { show: true, state: totalNeed > availableTokens ? "bad" : "ok", text, title, totalNeed, ok: true };
-}, [hasReadyMedia, doTranscribe, doTranslate, billingEstimate, translationEstimate, availableTokens]);
-
+ }, [
+   hasReadyMedia,
+   doTranscribe,
+   doTranslate,
+  doSummarize,
+   billingEstimate,
+   translationEstimate,
+  summarizationEstimate,
+ ]);
 
   const startUi = useMemo(() => {
     if (!threadIsValid) return { disabled: true, text: "Select", title: "Select a thread to begin" };
@@ -1281,7 +1374,14 @@ useEffect(() => {
   </Pill>
 
   <Pill type="button" $on={doSummarize} onClick={() => setDoSummarize((v) => !v)}>
-    Summarization
+    <PillInner>
+      <span>Summarization</span>
+      {summarizeMini.show ? (
+    <PillMiniBadge title={summarizeMini.title} $state={summarizeMini.state}>
+      {"~" + summarizeMini.text}
+    </PillMiniBadge>
+  ) : null}
+  </PillInner>
   </Pill>
 
   {totalBadge.show && (

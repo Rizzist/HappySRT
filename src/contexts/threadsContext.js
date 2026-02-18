@@ -14,12 +14,16 @@ import { safeLangKey, deleteLangKey } from "../lib/langKey";
 import * as BillingImport from "../shared/billingCatalog";
 import * as TranslationImport from "../shared/translationCatalog";
 import * as TranslationBillingImport from "../shared/translationBillingCatalog";
+import * as SummarizationBillingImport from "../shared/summarizationBillingCatalog";
+
 const TranslationCatalog = (TranslationImport && (TranslationImport.default || TranslationImport)) || {};
 const TR_DEFAULTS = TranslationCatalog?.DEFAULTS || {};
 
 const Billing = (BillingImport && (BillingImport.default || BillingImport)) || {};
 const TranslationBilling =
   (TranslationBillingImport && (TranslationBillingImport.default || TranslationBillingImport)) || {};
+const SummarizationBilling =
+  (SummarizationBillingImport && (SummarizationBillingImport.default || SummarizationBillingImport)) || {};
 
 const ThreadsContext = createContext(null);
 
@@ -91,6 +95,52 @@ function uuid() {
     return v.toString(16);
   });
 }
+
+function summarizePrefix(threadId, chatItemId) {
+  return `${String(threadId)}:chat:${String(chatItemId)}:sum:`;
+}
+
+function summarizeKey(threadId, chatItemId, modelId, targetLang) {
+   const mid = String(modelId || "").trim();
+  const lang = safeLangKey(targetLang) || String(targetLang || "auto").toLowerCase().trim() || "auto";
+   return `${summarizePrefix(threadId, chatItemId)}${mid || "model"}:${lang}`;
+ }
+
+function getTranscriptTextAny(chatItem) {
+  const r = chatItem?.results && typeof chatItem.results === "object" ? chatItem.results : {};
+  const t = String(r?.transcript || "").trim();
+  if (t) return t;
+
+  const segs = getTranscriptSegmentsAny(chatItem);
+  if (!segs.length) return "";
+  return segs.map((s) => String(s?.text || "").trim()).filter(Boolean).join(" ").trim();
+}
+
+function estimateSummaryMediaTokensDeterministic({ text, modelId, targetLang } = {}) {
+  const s = String(text || "").trim();
+  if (!s) return 0;
+  if (typeof SummarizationBilling?.estimateSummarizationRun !== "function") return 0;
+
+  try {
+    const opts = {};
+    if (modelId) opts.modelId = String(modelId);
+    if (targetLang) {
+      // estimator currently expects "language" (client-side), server expects "targetLang"
+      opts.language = String(targetLang);
+      opts.targetLang = String(targetLang);
+    }
+    const run = SummarizationBilling.estimateSummarizationRun({ text: s }, opts);
+    return Math.max(0, Math.round(Number(run?.mediaTokens || 0) || 0));
+  } catch {
+    try {
+      const run = SummarizationBilling.estimateSummarizationRun({ text: s }, null);
+      return Math.max(0, Math.round(Number(run?.mediaTokens || 0) || 0));
+    } catch {
+      return 0;
+    }
+  }
+}
+
 
 function ensureDraftShape(d) {
   const out = d && typeof d === "object" ? { ...d } : {};
@@ -519,6 +569,39 @@ function normalizeRunOptions(raw) {
   delete o.trTargetLangs;
   delete o.trLangs;
 
+    // ✅ normalize summarize (array-free, simple)
+  if (o.summarize && typeof o.summarize === "object") {
+    const s = o.summarize || {};
+
+    const modelId = String(s.modelId || TR_DEFAULTS?.modelId || "gpt-4o-mini");
+    const targetLangRaw =
+      s.targetLang ||
+      s.language || // legacy
+      s.lang || // legacy
+      o.summarizeTargetLang || // legacy
+      o.sumLang || // legacy
+      "auto";
+    const targetLang = safeLangKey(targetLangRaw) || String(targetLangRaw || "auto").toLowerCase().trim() || "auto";
+ 
+     o.summarize = {
+       enabled: !!s.enabled,
+       modelId,
+      targetLang,
+     };
+
+    return o;
+  }
+
+  // ✅ if caller set doSummarize but forgot summarize block, enforce defaults
+  if (o.doSummarize) {
+    const modelId = String(TR_DEFAULTS?.modelId || "gpt-4o-mini");
+    o.summarize = {
+      enabled: true,
+      modelId,
+      targetLang: "auto",
+    };
+  }
+
   // If translation block exists, normalize it (array-only)
   if (o.translation && typeof o.translation === "object") {
     const t = o.translation || {};
@@ -651,6 +734,93 @@ function langsToQueueFromStatus(chatItem, targetLangs, force) {
   }
   return out;
 }
+
+function setSummarizeQueuedOnThread({
+  threadId,
+  chatItemId,
+  modelId,
+  language,
+  tokens,
+  clearSummary,
+  setThreadsById,
+  threadsRef,
+  persist,
+  activeRef,
+  syncRef,
+  scope,
+} = {}) {
+  const tid = String(threadId || "");
+  const cid = String(chatItemId || "");
+  if (!tid || !cid) return;
+
+  const cur = threadsRef.current || {};
+  const t = cur[tid];
+  if (!t) return;
+
+  const items = ensureChatItemsArray(t.chatItems);
+  const idx = items.findIndex((x) => String(x?.chatItemId || "") === cid);
+  if (idx < 0) return;
+
+  const it = items[idx] || {};
+  const status = it.status || {};
+  const results = it.results || {};
+  const prevSum = status.summarize && typeof status.summarize === "object" ? status.summarize : {};
+
+  const now = nowIso();
+
+  const nextResults = clearSummary
+    ? { ...results, summary: "", summaryText: "", summarySrt: "" }
+    : results;
+
+  const billing = it?.billing && typeof it.billing === "object" ? it.billing : {};
+  const nTok = Math.max(0, Number(tokens || 0) || 0);
+
+  const nextItems = [...items];
+  nextItems[idx] = {
+    ...it,
+    billing: {
+      ...billing,
+      summarizePotentialTokens: nTok > 0 ? nTok : undefined,
+      summaryPotentialTokens: nTok > 0 ? nTok : undefined,
+    },
+    status: {
+      ...status,
+      summarize: {
+        ...prevSum,
+        state: "queued",
+        stage: "QUEUED",
+        progress: 0,
+        error: null,
+        modelId: modelId || prevSum.modelId || null,
+        // ✅ server contract: summarize.targetLang
+        targetLang: language || prevSum.targetLang || prevSum.language || prevSum.lang || "auto",
+        // ✅ keep legacy fields for UI/back-compat
+        language: language || prevSum.language || prevSum.lang || prevSum.targetLang || "auto",
+        lang: language || prevSum.lang || prevSum.targetLang || "auto",
+        queuedAt: now,
+        startedAt: null,
+        finishedAt: null,
+        potentialTokens: nTok > 0 ? nTok : undefined,
+        estimatedTokens: nTok > 0 ? nTok : undefined,
+      },
+    },
+    results: { ...nextResults },
+    updatedAt: now,
+  };
+
+  const nextThread = { ...t, chatItems: nextItems, updatedAt: now };
+  const nextThreads = { ...cur, [tid]: nextThread };
+
+  setThreadsById(nextThreads);
+  threadsRef.current = nextThreads;
+
+  try {
+    if (scope && String(activeRef.current) === String(tid)) {
+      persist(nextThreads, activeRef.current, syncRef.current).catch(() => {});
+    }
+  } catch {}
+}
+
 
 function setTranslateQueuedOnThread({
   threadId,
@@ -933,6 +1103,20 @@ const [creatingThread, setCreatingThread] = useState(false);
     typeof releaseMediaTokens === "function" &&
     typeof clearAllMediaReservations === "function";
 
+const releaseForSummarizeChatItem = (threadId, chatItemId) => {
+  if (!canReserve) return;
+  const tid = String(threadId || "");
+  const cid = String(chatItemId || "");
+  if (!tid || !cid) return;
+
+  const prefix = summarizePrefix(tid, cid);
+  const keys = Object.keys(reservedKeysRef.current || {});
+  for (const k of keys) {
+    if (k.startsWith(prefix)) releaseKey(k);
+  }
+};
+
+
   // key -> amount (mirror of AuthContext, but lets us transfer item->chat)
   const reservedKeysRef = useRef({});
 
@@ -1033,6 +1217,69 @@ const [creatingThread, setCreatingThread] = useState(false);
       }
     }
   };
+
+
+  const reserveForSummarizeChatItems = (threadId, chatItemIds, normalizedOptions, { force, clearSummary } = {}) => {
+  if (!canReserve) return;
+
+  const tid = String(threadId || "");
+  const ids = Array.isArray(chatItemIds) ? chatItemIds.map((x) => String(x || "")).filter(Boolean) : [];
+  if (!tid || !ids.length) return;
+
+  const t = (threadsRef.current || {})[tid];
+  const items = ensureChatItemsArray(t?.chatItems);
+
+  const s = normalizedOptions?.summarize && typeof normalizedOptions.summarize === "object" ? normalizedOptions.summarize : null;
+  if (!s || !s.enabled) return;
+
+  const modelId = String(s.modelId || TR_DEFAULTS?.modelId || "gpt-4o-mini");
+  const targetLang = String(s.targetLang || "auto") || "auto";
+
+  for (const cid of ids) {
+    const it = items.find((x) => String(x?.chatItemId || "") === cid);
+    if (!it) continue;
+
+    // skip if already running unless force
+    const curState = String(it?.status?.summarize?.state || "");
+    if (!force && (curState === "queued" || curState === "running")) continue;
+
+    const text = getTranscriptTextAny(it);
+    if (!text) continue;
+
+    const tok = estimateSummaryMediaTokensDeterministic({ text, modelId, targetLang });
+    if (!(tok > 0)) continue;
+
+    const key = summarizeKey(tid, cid, modelId, targetLang);
+
+    // ✅ make reserveKey idempotent (optional, but recommended)
+    const prev = Number(reservedKeysRef.current?.[key] || 0) || 0;
+    if (prev !== tok) {
+      if (prev > 0) releaseKey(key);
+      reserveKey(key, tok);
+    }
+
+    setSummarizeQueuedOnThread({
+      threadId: tid,
+      chatItemId: cid,
+      modelId,
+      language: targetLang,
+      tokens: tok,
+      clearSummary: !!clearSummary,
+      setThreadsById,
+      threadsRef,
+      persist,
+      activeRef,
+      syncRef,
+      scope,
+    });
+
+    patchLiveChatItem(tid, cid, {
+      billing: { summarizePotentialTokens: tok, summaryPotentialTokens: tok },
+      updatedAt: nowIso(),
+    });
+  }
+};
+
 
 
   const reserveForTranslateChatItems = (threadId, chatItemIds, normalizedOptions, { force, clearTranslate } = {}) => {
@@ -1703,6 +1950,17 @@ const [creatingThread, setCreatingThread] = useState(false);
         }
       } catch {}
 
+      // ✅ release summarize optimistic when done/failed/blocked
+try {
+  const su = patch?.status?.summarize && typeof patch.status.summarize === "object" ? patch.status.summarize : null;
+  const st = String(su?.state || "");
+  if (st === "done" || st === "failed" || st === "blocked") {
+    releaseForSummarizeChatItem(threadId, chatItemId);
+    refreshTokensThrottled().catch(() => {});
+  }
+} catch {}
+
+
       const cur = threadsRef.current || {};
       const t = cur[threadId];
       if (!t) return;
@@ -1747,6 +2005,7 @@ return;
         const ids = ensureChatItemsArray(liveT?.chatItems).map((x) => String(x?.chatItemId || "")).filter(Boolean);
         releaseForChatItems(tid, ids);
         releaseForTranslateChatItems(tid, ids);
+        for (const cid of ids) releaseForSummarizeChatItem(tid, cid);
       } catch {}
 
       refreshTokensThrottled().catch(() => {});
@@ -2747,6 +3006,46 @@ for (const l of langs) nextByLang = deleteLangKey(nextByLang, l);
   if (String(activeRef.current) === tid) persist(nextThreads, activeRef.current, syncRef.current).catch(() => {});
 };
 
+const retrySummarize = async ({ chatItemId, options } = {}) => {
+  const tid = String(activeRef.current || "");
+  const cid = String(chatItemId || "");
+  if (!tid || !cid) return;
+
+  const normalized = normalizeRunOptions({ ...(options || {}), doSummarize: true });
+  normalized.force = true;
+  normalized.doSummarize = true;
+
+  // ensure summarize block exists + enabled
+  normalized.summarize = normalized.summarize || {};
+  normalized.summarize.enabled = true;
+  normalized.summarize.targetLang = normalized.summarize.targetLang || "auto";
+
+  // support either clearSummary or clearSummarize flags
+  const clearSummary = !!(normalized.clearSummary || normalized.clearSummarize);
+
+  try {
+    reserveForSummarizeChatItems(tid, [cid], normalized, { force: true, clearSummary });
+
+    // ✅ Use the SAME transport pattern you already use for retryTranscribe/retryTranslate.
+    // If your existing code has a helper, call that instead.
+    if (wsClientRef.current && wsClientRef.current.isConnected()) {
+      wsClientRef.current.send("RETRY_SUMMARIZE", { threadId: tid, chatItemId: cid, options: normalized });
+    } else {
+      const jwt = await getJwtIfAny();
+      await postJson("/api/threads/retry_summarize", jwt, { threadId: tid, chatItemId: cid, options: normalized });
+    }
+
+    refreshTokensThrottled().catch(() => {});
+  } catch (err) {
+    // release optimistic reserve on immediate failure
+    releaseForSummarizeChatItem(tid, cid);
+
+    const msg = err?.message || "Failed to summarize";
+    toast.error(msg);
+  }
+};
+
+
 const retryTranslate = async ({ chatItemIds, chatItemId, options } = {}) => {
   const tid = wsBoundThreadRef.current || activeRef.current;
   if (!tid || tid === "default") {
@@ -2934,6 +3233,7 @@ const runLangs =
     startRun,
     retryTranscribe,
     retryTranslate,
+    retrySummarize,
     requestThreadSnapshot,
     requestMediaUrl,
 
