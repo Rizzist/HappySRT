@@ -1,3 +1,4 @@
+// _app.js
 import Head from "next/head";
 import { AuthProvider } from "../contexts/AuthContext";
 import { ThreadsProvider } from "@/contexts/threadsContext";
@@ -32,9 +33,13 @@ export default function App({ Component, pageProps }) {
       <FfmpegProvider>
         <ThreadsProvider>
           <GlobalStyle />
-            <Head>
-            <link rel="icon" href="/favicon.ico" sizes="any" />
-          </Head>
+<Head>
+  <link rel="icon" href="/favicon.ico" sizes="any" />
+  <link rel="manifest" href="/manifest.json" />
+  <meta name="theme-color" content="#ffffff" />
+  <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+</Head>
+
           <Component {...pageProps} />
         </ThreadsProvider>
       </FfmpegProvider>
