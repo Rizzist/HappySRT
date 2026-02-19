@@ -48,7 +48,7 @@ export default function BootScreen({ show, steps, error }) {
     <Overlay $visible={visible}>
       <Card>
         <Logo src="/logo.png" alt="happysrt" />
-        <Title>happysrt</Title>
+        <Title>HappySRT</Title>
         <Sub>{error ? "Startup problem" : "Loading your workspace…"}</Sub>
 
         {Array.isArray(steps) && steps.length > 0 && (
