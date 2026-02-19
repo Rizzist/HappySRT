@@ -69,7 +69,6 @@ export default function BootScreen({ show, steps, error }) {
             })}
           </Steps>
         )}
-
         {error ? <ErrorText>{String(error)}</ErrorText> : <Spinner />}
       </Card>
     </Overlay>
