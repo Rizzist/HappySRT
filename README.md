@@ -1,40 +1,148 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/pages/api-reference/create-next-app).
+# HappySRT
 
-## Getting Started
+<p align="center">
+  <a href="https://www.happysrt.com">
+    <img src="https://www.happysrt.com/logo.png" alt="HappySRT" width="96" height="96" />
+  </a>
+</p>
 
-First, run the development server:
+<h3 align="center">Open-source AI transcription, translation & summarization</h3>
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
+<p align="center">
+  Fast • Private-friendly • Built for creators
+</p>
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+<p align="center">
+  <a href="https://www.happysrt.com"><b>Live App</b></a>
+  •
+  <a href="#features"><b>Features</b></a>
+  •
+  <a href="#tech-stack"><b>Tech Stack</b></a>
+  •
+  <a href="#self-hosting"><b>Self-hosting</b></a>
+  •
+  <a href="#open-graph--social-preview"><b>Social Preview</b></a>
+  •
+  <a href="#contributing"><b>Contributing</b></a>
+</p>
 
-You can start editing the page by modifying `pages/index.js`. The page auto-updates as you edit the file.
+---
 
-[API routes](https://nextjs.org/docs/pages/building-your-application/routing/api-routes) can be accessed on [http://localhost:3000/api/hello](http://localhost:3000/api/hello). This endpoint can be edited in `pages/api/hello.js`.
+## What is HappySRT?
 
-The `pages/api` directory is mapped to `/api/*`. Files in this directory are treated as [API routes](https://nextjs.org/docs/pages/building-your-application/routing/api-routes) instead of React pages.
+HappySRT is a modern web app for turning audio/video into:
 
-This project uses [`next/font`](https://nextjs.org/docs/pages/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+- **Transcripts** (with timestamps / SRT)
+- **Translations** (subtitle tracks in other languages)
+- **Summaries** (highlights + bullet notes)
 
-## Learn More
+It’s built as a **threaded workspace**, so each project can keep its own uploads, outputs, and exports.
 
-To learn more about Next.js, take a look at the following resources:
+> ⭐ If you find this useful, please star the repo — it helps others discover the project.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn-pages-router) - an interactive Next.js tutorial.
+---
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Features
 
-## Deploy on Vercel
+- **Transcription** → clean text with timestamps (SRT-ready)
+- **Translation** → generate multi-language subtitle tracks
+- **Summarization** → highlights + bullet points
+- **Threads** → separate workspaces per project
+- **Exports** → save/copy/download outputs (SRT/Text)
+- **Token-based usage UI** → “media tokens” shown in the sidebar + usage badges
+- **Billing flow** → upgrade plans + Stripe checkout/portal hooks
+- **PWA-ready** (optional) installable app experience
+- **Clean UI** → styled-components + minimal “red as accent” design
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+---
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/pages/building-your-application/deploying) for more details.
+## Tech Stack
+
+- **Next.js** (Pages Router)
+- **React**
+- **styled-components**
+- **Appwrite** (auth / DB / storage)
+- **FFmpeg (in-browser)** for media handling
+- **Stripe** (billing / checkout / customer portal)
+
+---
+
+## How the app works
+
+### Threads & workflow
+1. Create (or open) a thread from the left sidebar.
+2. Upload audio/video (or paste a link if enabled).
+3. Choose what you want to run:
+   - Transcription
+   - Translation
+   - Summarization
+4. Outputs show up inside the thread as the run completes.
+5. Export/copy/save results (ex: SRT / Text).
+
+### Media tokens & upgrades
+- The UI shows your **Media Tokens** balance.
+- Running jobs consumes tokens based on media size/length and selected actions.
+- If you’re running low, use **Upgrade** to purchase a plan / more capacity.
+- Billing is handled via Stripe (checkout + portal).
+
+---
+
+## Self-hosting
+
+HappySRT is fully open source and self-hostable. You’ll need to provide your own:
+- **Appwrite** project (auth + DB + storage)
+- **Stripe** keys (if enabling billing)
+- Any model/provider credentials you use for transcription/translation/summarization
+
+### Environment variables
+Create a `.env.local` file in the project root.
+
+Tip: to see exactly what’s required in *your* codebase, search for `process.env.`.
+
+Common categories:
+- Appwrite endpoint / project ID / keys
+- Stripe secret key / webhook secret (if used)
+- Storage credentials (S3 / B2, if configured)
+- Any AI provider keys (if configured)
+
+---
+
+## Open Graph / Social Preview
+
+This repo includes an OG image builder page:
+
+- Visit `/og`
+- Click **Download PNG**
+- Put the file at `public/og.png`
+- Reference it in your SEO tags as the `og:image`
+
+---
+
+## Contributing
+
+Issues and PRs are welcome.
+
+Good first contributions:
+- UI/UX polish
+- Better export options (SRT/JSON/CSV)
+- More language support / presets
+- Performance improvements
+- Docs + deployment guides (Vercel, Amplify, Docker, etc.)
+
+Suggested workflow:
+- Fork → branch → PR
+
+---
+
+## Security / Privacy Notes
+
+- Never commit secrets (use `.env.local`)
+- Treat uploaded media and generated transcripts as sensitive data
+- If you enable external providers, review their data retention policies
+
+---
+
+## License
+
+Add your license here (MIT / Apache-2.0 / etc).
+

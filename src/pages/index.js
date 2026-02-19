@@ -6,6 +6,7 @@ import { useAuth } from "../contexts/AuthContext";
 import { useFfmpeg } from "../contexts/FfmpegContext";
 import { useThreads } from "../contexts/threadsContext";
 import { toast } from "sonner";
+import SEOHead from "@/components/SEOHead";
 
 export default function Home() {
   const {
@@ -78,6 +79,20 @@ export default function Home() {
 
   return (
     <>
+      <SEOHead
+    title="AI Transcription, Translation & Summarization"
+    description="HappySRT is an open-source AI transcription, translation, and summarization app. Upload audio/video and get transcripts, translations, and summaries fast."
+    path="/"
+  />
+
+  {/* Optional but recommended: visible SSR text for crawlers */}
+  <main style={{ position: "absolute", left: -9999, top: "auto", width: 1, height: 1, overflow: "hidden" }}>
+    <h1>HappySRT — AI transcription, translation, and summarization</h1>
+    <p>
+      Open-source web app to transcribe audio/video, translate into multiple languages, and generate summaries.
+    </p>
+  </main>
+
       <BootScreen show={showBoot} steps={steps} error={bootError} />
 
       {!showBoot && (
