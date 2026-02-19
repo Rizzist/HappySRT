@@ -5,6 +5,7 @@ import { getLocalMediaMeta, putLocalMediaMeta } from "../lib/mediaMetaStore";
 import { getMediaIndex } from "../lib/mediaIndexStore";
 import { useAuth } from "../contexts/AuthContext";
 import { useThreads } from "../contexts/threadsContext";
+import { makeScope, scopeCandidates } from "../lib/scopeKey";
 
 function isBrowser() {
   return typeof window !== "undefined";
@@ -87,10 +88,8 @@ export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, 
   const { user, isAnonymous } = useAuth();
   const { requestMediaUrl, wsStatus } = useThreads();
 
-    const scope = useMemo(() => {
-      const uid = String(user?.$id || "").trim();
-      return uid || "guest"; // ✅ anonymous gets its own stable scope as long as cookie/session persists
-    }, [user?.$id]);
+  const scope = useMemo(() => makeScope(user, isAnonymous), [user?.$id, isAnonymous]);
+  
 
   const chatItemId = String(item?.chatItemId || "");
   const mimeHint = String(media?.mime || "");
@@ -197,11 +196,8 @@ export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, 
       }
 
       // Build scopes to try (covers "uploaded as guest then logged in" too)
-      const scopesToTry = [];
-      if (scope) scopesToTry.push(scope);
-      scopesToTry.push("guest");
-      if (user?.$id) scopesToTry.push(String(user.$id));
-      const uniqScopes = Array.from(new Set(scopesToTry.filter(Boolean)));
+      const uniqScopes = scopeCandidates(user, isAnonymous);
+
 
       // 1) Wait for clientFileId resolution (prevents remote-first flicker)
       if (clientFileId === undefined) {
@@ -320,7 +316,7 @@ export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, 
       if (cacheAttemptedRef.current.has(cacheKey)) return;
       cacheAttemptedRef.current.add(cacheKey);
 
-      const sc = scope || "guest";
+      const sc = makeScope(user, isAnonymous) || "guest";
 
       setStage("downloading");
       try {

@@ -6,6 +6,8 @@ import { useThreads } from "../contexts/threadsContext";
 import { useAuth } from "../contexts/AuthContext";
 import { getLocalMedia } from "../lib/mediaStore";
 
+import { makeScope } from "@/lib/scopeKey";
+
 import * as CatalogImport from "../shared/transcriptionCatalog";
 import * as BillingImport from "../shared/billingCatalog";
 import * as TranslationImport from "../shared/translationCatalog";
@@ -454,6 +456,9 @@ const [sumTargetLang, setSumTargetLang] = useState(() =>
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+    const scope = useMemo(() => makeScope(user, isAnonymous), [user?.$id, isAnonymous]);
+    
+
   // ✅ FIX: depend on `files` (not `files.length`) so stage changes update previews.
   useEffect(() => {
     let alive = true;
@@ -462,7 +467,6 @@ const [sumTargetLang, setSumTargetLang] = useState(() =>
       if (!thread?.id) return;
 
       const next = {};
-      const scope = isAnonymous ? "guest" : user?.$id;
 
       for (const f of files) {
         const itemId = f?.itemId;

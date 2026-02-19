@@ -10,6 +10,8 @@ import { createThreadWsClient } from "../lib/wsThreadsClient";
 import { putMediaIndex, getMediaIndex } from "../lib/mediaIndexStore";
 import { putLocalMediaMeta } from "../lib/mediaMetaStore";
 import { safeLangKey, deleteLangKey } from "../lib/langKey";
+import { makeScope } from "../lib/scopeKey";
+
 
 import * as BillingImport from "../shared/billingCatalog";
 import * as TranslationImport from "../shared/translationCatalog";
@@ -1033,11 +1035,8 @@ const [creatingThread, setCreatingThread] = useState(false);
     activeRef.current = activeId;
   }, [activeId]);
 
-  const scope = useMemo(() => {
-    const uid = user?.$id ? String(user.$id) : null;
-    if (!uid) return null;
-    return isAnonymous ? `anon:${uid}` : `user:${uid}`;
-  }, [user?.$id, isAnonymous]);
+  const scope = useMemo(() => makeScope(user, isAnonymous), [user?.$id, isAnonymous]);
+
 
   const bootedRef = useRef(false);
 
