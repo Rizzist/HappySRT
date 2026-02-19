@@ -1845,7 +1845,9 @@ const releaseForSummarizeChatItem = (threadId, chatItemId) => {
 
     let nextStepValue;
 
-    if (lang) {
+    const useLang = step === "translate" && lang;
+
+    if (useLang) {
       const stepMap = existingStep && typeof existingStep === "object" && !Array.isArray(existingStep) ? existingStep : {};
       const arr = Array.isArray(stepMap[lang]) ? stepMap[lang] : [];
       const nextArr = append ? [...arr, ...incoming] : [...incoming];
@@ -1854,6 +1856,7 @@ const releaseForSummarizeChatItem = (threadId, chatItemId) => {
       const arr = Array.isArray(existingStep) ? existingStep : [];
       nextStepValue = append ? [...arr, ...incoming] : [...incoming];
     }
+
 
     return {
       ...(prev || {}),
@@ -1892,12 +1895,15 @@ const releaseForSummarizeChatItem = (threadId, chatItemId) => {
 
     let nextStepValue;
 
-    if (lang) {
-      const stepMap = existingStep && typeof existingStep === "object" && !Array.isArray(existingStep) ? existingStep : {};
-      nextStepValue = { ...stepMap, [lang]: progress };
-    } else {
-      nextStepValue = progress;
-    }
+      const useLang = step === "translate" && lang;
+
+      if (useLang) {
+        const stepMap = existingStep && typeof existingStep === "object" && !Array.isArray(existingStep) ? existingStep : {};
+        nextStepValue = { ...stepMap, [lang]: progress };
+      } else {
+        nextStepValue = progress;
+      }
+
 
     return {
       ...(prev || {}),
@@ -1937,7 +1943,9 @@ const releaseForSummarizeChatItem = (threadId, chatItemId) => {
 
     let nextStepValue;
 
-    if (lang) {
+    const useLang = step === "translate" && lang;
+
+    if (useLang) {
       const stepMap = existingStep && typeof existingStep === "object" && !Array.isArray(existingStep) ? existingStep : {};
       const arr = Array.isArray(stepMap[lang]) ? stepMap[lang] : [];
       nextStepValue = { ...stepMap, [lang]: [...arr, text] };
@@ -1945,6 +1953,7 @@ const releaseForSummarizeChatItem = (threadId, chatItemId) => {
       const arr = Array.isArray(existingStep) ? existingStep : [];
       nextStepValue = [...arr, text];
     }
+
 
     return {
       ...(prev || {}),

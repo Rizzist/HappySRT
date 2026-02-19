@@ -15,6 +15,7 @@
     "appwrite": "^21.5.0",
     "cookie": "^1.1.1",
     "formidable": "^3.5.4",
+    "jszip": "^3.10.1",
     "localforage": "^1.10.0",
     "mime-types": "^3.0.2",
     "next": "16.1.6",
