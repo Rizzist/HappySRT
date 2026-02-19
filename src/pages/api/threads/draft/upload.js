@@ -288,7 +288,9 @@ async function undoMonthlyReservation({ ownerId, ym, bytesToSubtract }) {
 
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ message: "Method not allowed" });
-
+  return res.status(405).json({ message: "Method not allowed" });
+  // deprecated endpoint
+  
   let owner;
   try {
     owner = await requireOwner(req, res);

@@ -24,6 +24,15 @@ function safeClose(ws, code, reason) {
   } catch {}
 }
 
+function uuid() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 export function createThreadWsClient({
   url,
   threadId,
@@ -46,8 +55,14 @@ export function createThreadWsClient({
   let helloTimer = null;
   const HELLO_TIMEOUT_MS = 8000;
 
+  // HELLO_OK tracking (important for uploads / privileged actions)
+  let helloOk = false;
+
   // Keep the latest client state (optional)
   let latestClientState = clientState || null;
+
+  // Message subscribers (lets upload helper wait for specific server replies)
+  const msgListeners = new Set();
 
   function emitStatus(status, extra) {
     if (typeof onStatus === "function") {
@@ -82,9 +97,7 @@ export function createThreadWsClient({
     clearReconnect();
     reconnectAttempt = Math.min(reconnectAttempt + 1, 8);
 
-    // exp backoff (1s, 2s, 4s...) capped
     const base = Math.min(1000 * Math.pow(2, reconnectAttempt - 1), 15000);
-    // small jitter
     const jitter = Math.floor(Math.random() * 350);
     const ms = base + jitter;
 
@@ -106,12 +119,79 @@ export function createThreadWsClient({
     }
   }
 
+  function sendBinary(data) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    try {
+      ws.send(data);
+      return true;
+    } catch (e) {
+      if (typeof onError === "function") onError(e);
+      return false;
+    }
+  }
+
+  function getBufferedAmount() {
+    try {
+      return ws ? Number(ws.bufferedAmount || 0) : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  async function waitForBufferedBelow(maxBytes, timeoutMs) {
+    const max = Math.max(0, Number(maxBytes || 0) || 0);
+    const timeout = Math.max(200, Number(timeoutMs || 0) || 0);
+
+    if (!max) return true;
+    const start = Date.now();
+
+    while (true) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+      const b = getBufferedAmount();
+      if (b <= max) return true;
+      if (Date.now() - start > timeout) return false;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+
   // Ensure payload is an object, shallow cloned, with a correct threadId.
-  // NOTE: We DO NOT strip legacy translation keys here anymore — we just send what we have.
   function normalizePayload(payload) {
     const p = payload && typeof payload === "object" ? { ...payload } : {};
-    p.threadId = TID; // always enforce
+    p.threadId = TID;
     return p;
+  }
+
+  function onMessage(fn) {
+    if (typeof fn !== "function") return () => {};
+    msgListeners.add(fn);
+    return () => {
+      try {
+        msgListeners.delete(fn);
+      } catch {}
+    };
+  }
+
+  async function waitForReady(timeoutMs) {
+    const timeout = Math.max(500, Number(timeoutMs || 0) || 0);
+
+    // already ready
+    if (ws && ws.readyState === WebSocket.OPEN && helloOk) return true;
+
+    const start = Date.now();
+    return new Promise((resolve) => {
+      const t = setInterval(() => {
+        const ok = ws && ws.readyState === WebSocket.OPEN && helloOk;
+        if (ok) {
+          clearInterval(t);
+          resolve(true);
+          return;
+        }
+        if (Date.now() - start > timeout) {
+          clearInterval(t);
+          resolve(false);
+        }
+      }, 50);
+    });
   }
 
   async function connect() {
@@ -121,12 +201,13 @@ export function createThreadWsClient({
       return;
     }
 
-    // already open/connecting
     if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
 
     closedByUser = false;
     clearReconnect();
     clearHelloTimeout();
+
+    helloOk = false;
 
     emitStatus("connecting");
 
@@ -134,8 +215,6 @@ export function createThreadWsClient({
 
     ws.onopen = async () => {
       reconnectAttempt = 0;
-
-      // socket is open, but not authed yet
       emitStatus("socket_open");
 
       let jwt = null;
@@ -147,7 +226,6 @@ export function createThreadWsClient({
         return;
       }
 
-      // HELLO handshake
       sendRaw({
         type: "HELLO",
         threadId: TID,
@@ -169,19 +247,28 @@ export function createThreadWsClient({
       const type = String(msg?.type || "");
 
       if (type === "HELLO_OK") {
+        helloOk = true;
         clearHelloTimeout();
         emitStatus("ready", { serverTime: msg?.payload?.serverTime || null });
       } else if (type === "ERROR" || type === "HELLO_ERROR" || type === "HELLO_FAIL") {
-        // prevent a late timeout close after an error response
         clearHelloTimeout();
       }
 
+      // notify subscribers FIRST (upload helper waits here)
+      try {
+        for (const fn of Array.from(msgListeners)) {
+          try {
+            fn(msg);
+          } catch {}
+        }
+      } catch {}
+
+      // then pass to ThreadsContext
       if (typeof onEvent === "function") onEvent(msg);
     };
 
     ws.onerror = (evt) => {
       if (typeof onError === "function") onError(evt);
-      // don't force-close here; wait for onclose
     };
 
     ws.onclose = (evt) => {
@@ -190,24 +277,20 @@ export function createThreadWsClient({
       const wasClean = !!evt?.wasClean;
 
       clearHelloTimeout();
+      helloOk = false;
 
-      // If we didn't explicitly disconnect, attempt reconnect.
       if (!closedByUser) {
-        // "abnormal" closes can be treated as error-ish, but still reconnect.
         if (!wasClean && code && code !== 1000 && code !== 1001) {
           emitStatus("error", { message: `WS closed (${code}) ${reason || ""}`.trim() });
         } else {
           emitStatus("disconnected", { code, reason: reason || null });
         }
 
-        // clear instance to allow new WebSocket
         ws = null;
-
         scheduleReconnect({ code, reason: reason || null });
         return;
       }
 
-      // user initiated
       emitStatus("disconnected", { code, reason: reason || null });
       ws = null;
     };
@@ -220,6 +303,7 @@ export function createThreadWsClient({
 
     const cur = ws;
     ws = null;
+    helloOk = false;
 
     safeClose(cur, code || 1000, reason || "client_disconnect");
     emitStatus("disconnected", { code: code || 1000, reason: reason || "client_disconnect" });
@@ -229,23 +313,25 @@ export function createThreadWsClient({
     return !!ws && ws.readyState === WebSocket.OPEN;
   }
 
-  // Generic send
-  function send(type, payload) {
-    const t = safeStr(type);
-    if (!t) return false;
+function send(type, payload, requestId) {
+  const t = safeStr(type);
+  if (!t) return false;
 
-    // NOTE: no translation key stripping; whatever options/translation is present is sent as-is.
-    const p = normalizePayload(payload);
+  const p = normalizePayload(payload);
 
-    return sendRaw({
-      type: t,
-      threadId: TID,
-      ts: nowIso(),
-      payload: p,
-    });
-  }
+  const msg = {
+    type: t,
+    threadId: TID,
+    ts: nowIso(),
+    payload: p,
+  };
 
-  // optional: update the clientState we include in HELLO for future reconnects
+  if (requestId) msg.requestId = String(requestId);
+
+  return sendRaw(msg);
+}
+
+
   function setClientState(next) {
     latestClientState = next && typeof next === "object" ? { ...next } : null;
   }
@@ -259,7 +345,14 @@ export function createThreadWsClient({
     disconnect,
     isConnected,
     send,
+    sendBinary,
+    getBufferedAmount,
+    waitForBufferedBelow,
+    waitForReady,
+    onMessage,
     setClientState,
     getThreadId,
+    // handy for correlation ids in helpers
+    uuid,
   };
 }

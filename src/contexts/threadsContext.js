@@ -11,6 +11,7 @@ import { putMediaIndex, getMediaIndex } from "../lib/mediaIndexStore";
 import { putLocalMediaMeta } from "../lib/mediaMetaStore";
 import { safeLangKey, deleteLangKey } from "../lib/langKey";
 import { makeScope } from "../lib/scopeKey";
+import { uploadDraftFileViaWs, uploadDraftUrlViaWs } from "../lib/wsDraftUploadClient";
 
 
 import * as BillingImport from "../shared/billingCatalog";
@@ -1027,6 +1028,75 @@ export function ThreadsProvider({ children }) {
   const creatingThreadRef = useRef(false);
 const [creatingThread, setCreatingThread] = useState(false);
 
+// ✅ Add these helpers ONCE inside ThreadsProvider (near other refs/helpers)
+const draftUploadUiRef = useRef({}); // itemId -> { at, pct, stage }
+
+const clampPctInt = (p) => {
+  const n = Number(p);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(100, Math.round(n)));
+};
+
+// Patch draft file UI fields WITHOUT calling commit/persist (so we can update often)
+const patchDraftFileUi = (threadId, itemId, patch) => {
+  const tid = String(threadId || "");
+  const iid = String(itemId || "");
+  if (!tid || !iid) return;
+
+  setThreadsById((prev) => {
+    const cur = prev || {};
+    const t = cur[tid];
+    if (!t) return prev;
+
+    const d = ensureDraftShape(t.draft);
+    const files = Array.isArray(d.files) ? d.files : [];
+    const idx = files.findIndex((x) => String(x?.itemId || "") === iid);
+    if (idx < 0) return prev;
+
+    const prevF = files[idx] || {};
+    const nextF = { ...prevF, ...(patch || {}), updatedAt: nowIso() };
+
+    const nextFiles = [...files];
+    nextFiles[idx] = nextF;
+
+    const nextThread = { ...t, draft: { ...d, files: nextFiles }, updatedAt: nowIso() };
+    const next = { ...cur, [tid]: nextThread };
+    threadsRef.current = next;
+    return next;
+  });
+};
+
+const forwardUploadProgressToDraft = (threadId, itemId, ev) => {
+  const iid = String(itemId || "");
+  if (!iid) return;
+
+  const now = Date.now();
+  const pct = clampPctInt(ev?.pct);
+  const stage = String(ev?.stage || "").trim();
+  const sentBytes = Number(ev?.sentBytes || 0) || null;
+  const receivedBytes = Number(ev?.receivedBytes || 0) || null;
+
+  const last = draftUploadUiRef.current[iid] || {};
+  const changed =
+    (pct != null && pct !== last.pct) ||
+    (stage && stage !== last.stage) ||
+    !last.at ||
+    now - last.at > 200; // throttle
+
+  if (!changed) return;
+
+  draftUploadUiRef.current[iid] = { at: now, pct, stage };
+
+  patchDraftFileUi(threadId, iid, {
+    stage: "uploading",
+    uploadPct: pct,
+    uploadStage: stage || null,
+    uploadSentBytes: sentBytes,
+    uploadReceivedBytes: receivedBytes,
+  });
+};
+
+
   useEffect(() => {
     threadsRef.current = threadsById;
   }, [threadsById]);
@@ -1451,6 +1521,7 @@ const releaseForSummarizeChatItem = (threadId, chatItemId) => {
     if (!tid || !ids.length) return;
     for (const cid of ids) releaseForTranslateChatItem(tid, cid);
   };
+  
 
   const reserveForDraftItemIds = (threadId, itemIds) => {
     if (!canReserve) return;
@@ -2499,118 +2570,141 @@ return;
 
     await commit({ ...cur, [threadId]: nextThread }, activeRef.current, syncRef.current);
 
-    return toast.promise(
-      (async () => {
-        const jwt = await getJwtIfAny();
-        let mp3File = file;
+return toast.promise(
+  (async () => {
+    const jwt = await getJwtIfAny();
+    let mp3File = file;
 
-        if (!isMp3(file)) {
-          mp3File = await convertToMp3OrPassThrough(file, { ensureFfmpeg, extractAudioToMp3 });
+    // If mp3 already, mark upload progress start
+    if (isMp3(file)) {
+      patchDraftFileUi(threadId, itemId, { stage: "uploading", uploadPct: 0, uploadStage: "verifying" });
+    }
 
-          const curMid = threadsRef.current || {};
-          const tMid = curMid[threadId];
-          if (tMid) {
-            const dMid = ensureDraftShape(tMid.draft);
-            const filesMid = [...(dMid.files || [])];
-            const idx = filesMid.findIndex((x) => String(x?.itemId) === String(itemId));
-            if (idx >= 0) {
-              filesMid[idx] = { ...filesMid[idx], stage: "uploading", updatedAt: nowIso() };
-              const nextTMid = {
-                ...tMid,
-                draft: { ...dMid, files: filesMid },
-                draftRev: (tMid.draftRev || 0) + 1,
-                draftUpdatedAt: nowIso(),
-                updatedAt: nowIso(),
-              };
-              await commit({ ...curMid, [threadId]: nextTMid }, activeRef.current, syncRef.current);
-            }
-          }
-        }
+    if (!isMp3(file)) {
+      mp3File = await convertToMp3OrPassThrough(file, { ensureFfmpeg, extractAudioToMp3 });
 
-        try {
-          const dur = await probeDurationSecondsFromFile(mp3File);
-          if (dur != null) localMeta.durationSeconds = dur;
-        } catch {}
-
-        const fd = new FormData();
-        fd.append("threadId", threadId);
-        fd.append("itemId", itemId);
-        fd.append("clientFileId", clientFileId);
-        fd.append("sourceType", "upload");
-        fd.append("localMeta", JSON.stringify(localMeta));
-        fd.append("file", mp3File, mp3File?.name || `${baseName(file?.name)}.mp3`);
-
-        const r = await postForm("/api/threads/draft/upload", jwt, fd);
-
-        const cur2 = threadsRef.current || {};
-        const t2 = cur2[threadId];
-        if (!t2) return itemId;
-
-        const d2 = ensureDraftShape(t2.draft);
-        const files2 = [...(d2.files || [])];
-        const idx2 = files2.findIndex((x) => String(x?.itemId) === String(itemId));
-        if (idx2 >= 0) {
-          const prev = files2[idx2] || {};
-          const srv = r && r.draftFile ? r.draftFile : {};
-
-          files2[idx2] = {
-            ...prev,
-            ...srv,
-            clientFileId: prev.clientFileId,
-            local: prev.local,
-            audio: { ...(prev.audio || {}), ...(srv.audio || {}) },
-            stage: srv && srv.stage ? srv.stage : "uploaded",
+      const curMid = threadsRef.current || {};
+      const tMid = curMid[threadId];
+      if (tMid) {
+        const dMid = ensureDraftShape(tMid.draft);
+        const filesMid = [...(dMid.files || [])];
+        const idx = filesMid.findIndex((x) => String(x?.itemId) === String(itemId));
+        if (idx >= 0) {
+          filesMid[idx] = {
+            ...filesMid[idx],
+            stage: "uploading",
+            uploadPct: 0,
+            uploadStage: "verifying",
             updatedAt: nowIso(),
           };
+          const nextTMid = {
+            ...tMid,
+            draft: { ...dMid, files: filesMid },
+            draftRev: (tMid.draftRev || 0) + 1,
+            draftUpdatedAt: nowIso(),
+            updatedAt: nowIso(),
+          };
+          await commit({ ...curMid, [threadId]: nextTMid }, activeRef.current, syncRef.current);
         }
-
-        const nextT2 = {
-          ...t2,
-          draft: { ...d2, files: files2 },
-          draftRev: typeof r.draftRev === "number" ? r.draftRev : (t2.draftRev || 0) + 1,
-          draftUpdatedAt: r.draftUpdatedAt || nowIso(),
-          updatedAt: nowIso(),
-        };
-
-        await commit({ ...cur2, [threadId]: nextT2 }, activeRef.current, syncRef.current);
-        return itemId;
-      })(),
-      {
-        loading: isMp3(file) ? "Uploading mp3…" : "Converting to mp3…",
-        success: "Uploaded",
-        error: async (e) => {
-          try {
-            if (scope) await deleteLocalMedia(scope, threadId, clientFileId);
-          } catch {}
-
-          try {
-            const cur2 = threadsRef.current || {};
-            const t2 = cur2[threadId];
-            if (t2) {
-              const d2 = ensureDraftShape(t2.draft);
-              const files2 = (d2.files || []).filter((x) => String(x?.itemId) !== String(itemId));
-              const nextT2 = {
-                ...t2,
-                draft: { ...d2, files: files2 },
-                draftRev: (t2.draftRev || 0) + 1,
-                draftUpdatedAt: nowIso(),
-                updatedAt: nowIso(),
-              };
-              await commit({ ...cur2, [threadId]: nextT2 }, activeRef.current, syncRef.current);
-            }
-          } catch {}
-
-          // ✅ NEW: auto-open upgrade + better toast message
-          if (isUpgradeLimitError(e)) {
-            openUpgradeFromError(e);
-            return formatUpgradeMessage(e); // this becomes the toast.promise error text
-          }
-
-          return e?.message || "Upload failed";
-        },
-
       }
-    );
+    }
+
+    try {
+      const dur = await probeDurationSecondsFromFile(mp3File);
+      if (dur != null) localMeta.durationSeconds = dur;
+    } catch {}
+
+    // ✅ ensure WS connected
+    await connectWsForThread(threadId);
+
+    // ✅ upload via websocket (binary chunk stream) + forward progress to draft UI
+    const r = await uploadDraftFileViaWs({
+      wsClient: wsClientRef.current,
+      threadId,
+      itemId,
+      clientFileId,
+      file: mp3File,
+      localMeta,
+      onProgress: (ev) => {
+        try {
+          forwardUploadProgressToDraft(threadId, itemId, ev);
+        } catch {}
+      },
+    });
+
+    const cur2 = threadsRef.current || {};
+    const t2 = cur2[threadId];
+    if (!t2) return itemId;
+
+    const d2 = ensureDraftShape(t2.draft);
+    const files2 = [...(d2.files || [])];
+    const idx2 = files2.findIndex((x) => String(x?.itemId) === String(itemId));
+    if (idx2 >= 0) {
+      const prev = files2[idx2] || {};
+      const srv = r && r.draftFile ? r.draftFile : {};
+
+      files2[idx2] = {
+        ...prev,
+        ...srv,
+        clientFileId: prev.clientFileId,
+        local: prev.local,
+        audio: { ...(prev.audio || {}), ...(srv.audio || {}) },
+        stage: srv && srv.stage ? srv.stage : "uploaded",
+        // ✅ clear progress fields once done
+        uploadPct: null,
+        uploadStage: null,
+        uploadSentBytes: null,
+        uploadReceivedBytes: null,
+        updatedAt: nowIso(),
+      };
+    }
+
+    const nextT2 = {
+      ...t2,
+      draft: { ...d2, files: files2 },
+      draftRev: typeof r.draftRev === "number" ? r.draftRev : (t2.draftRev || 0) + 1,
+      draftUpdatedAt: r.draftUpdatedAt || nowIso(),
+      updatedAt: nowIso(),
+    };
+
+    await commit({ ...cur2, [threadId]: nextT2 }, activeRef.current, syncRef.current);
+    return itemId;
+  })(),
+  {
+    // ✅ keep your original toast UX
+    loading: isMp3(file) ? "Uploading mp3…" : "Converting to mp3…",
+    success: "Uploaded",
+    error: async (e) => {
+      try {
+        if (scope) await deleteLocalMedia(scope, threadId, clientFileId);
+      } catch {}
+
+      try {
+        const cur2 = threadsRef.current || {};
+        const t2 = cur2[threadId];
+        if (t2) {
+          const d2 = ensureDraftShape(t2.draft);
+          const files2 = (d2.files || []).filter((x) => String(x?.itemId) !== String(itemId));
+          const nextT2 = {
+            ...t2,
+            draft: { ...d2, files: files2 },
+            draftRev: (t2.draftRev || 0) + 1,
+            draftUpdatedAt: nowIso(),
+            updatedAt: nowIso(),
+          };
+          await commit({ ...cur2, [threadId]: nextT2 }, activeRef.current, syncRef.current);
+        }
+      } catch {}
+
+      if (isUpgradeLimitError(e)) {
+        openUpgradeFromError(e);
+        return formatUpgradeMessage(e);
+      }
+
+      return e?.message || "Upload failed";
+    },
+  }
+);
   };
 
   const addDraftMediaFromUrl = async (threadId, url) => {

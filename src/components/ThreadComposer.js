@@ -429,6 +429,21 @@ const [sumTargetLang, setSumTargetLang] = useState(() =>
   const [playingId, setPlayingId] = useState(null);
   const mediaRefs = useRef({});
 
+  const objectUrlsRef = useRef({});
+  const objectUrlMetaRef = useRef({}); // itemId -> clientFileId
+
+  const filesPreviewKey = useMemo(() => {
+    return (files || [])
+      .map((f) => {
+        const itemId = String(f?.itemId || "");
+        const clientFileId = String(f?.clientFileId || "");
+        const hasLocal = f?.local ? "1" : "0";
+        const url = f?.sourceType === "url" ? String(f?.url || "") : "";
+        return `${itemId}:${clientFileId}:${hasLocal}:${url}`;
+      })
+      .join("|");
+  }, [files]);
+
   const asrModelOptions = useMemo(() => {
     if (typeof getModelsForLanguage !== "function") return [];
     return safeArr(getModelsForLanguage(asrLang));
@@ -459,45 +474,6 @@ const [sumTargetLang, setSumTargetLang] = useState(() =>
     const scope = useMemo(() => makeScope(user, isAnonymous), [user?.$id, isAnonymous]);
     
 
-  // ✅ FIX: depend on `files` (not `files.length`) so stage changes update previews.
-  useEffect(() => {
-    let alive = true;
-
-    (async () => {
-      if (!thread?.id) return;
-
-      const next = {};
-
-      for (const f of files) {
-        const itemId = f?.itemId;
-        const clientFileId = f?.clientFileId;
-        const local = f?.local;
-        if (!itemId || !clientFileId || !local) continue;
-
-        try {
-          const blob = await getLocalMedia(scope, thread.id, clientFileId);
-          if (blob) next[itemId] = URL.createObjectURL(blob);
-        } catch {}
-      }
-
-      if (!alive) return;
-
-      setObjectUrls((prev) => {
-        for (const k of Object.keys(prev)) {
-          if (!next[k]) {
-            try {
-              URL.revokeObjectURL(prev[k]);
-            } catch {}
-          }
-        }
-        return next;
-      });
-    })();
-
-    return () => {
-      alive = false;
-    };
-  }, [thread?.id, isAnonymous, user?.$id, files]);
 
   useEffect(() => {
     for (const [id, el] of Object.entries(mediaRefs.current || {})) {
@@ -519,52 +495,62 @@ const [sumTargetLang, setSumTargetLang] = useState(() =>
     return (files || []).filter((f) => f?.itemId && isReadyDraftFile(f));
   }, [files]);
 
-    useEffect(() => {
+  useEffect(() => {
     let cancelled = false;
 
     (async () => {
-      if (!readyFiles.length) return;
+      if (!thread?.id) return;
 
-      // only probe items that are ready AND missing duration in draft metadata
-      const next = {};
+      const nextMap = { ...(objectUrlsRef.current || {}) };
+      const nextMeta = { ...(objectUrlMetaRef.current || {}) };
 
-      for (const f of readyFiles) {
+      const want = new Set();
+
+      for (const f of files || []) {
         const itemId = String(f?.itemId || "");
-        if (!itemId) continue;
+        const clientFileId = String(f?.clientFileId || "");
+        const local = f?.local;
 
-        // already known via draft metadata?
-        const known = durationSecondsFromDraftFile(f);
-        if (known != null) {
-          next[itemId] = known;
-          continue;
-        }
+        if (!itemId || !clientFileId || !local) continue;
 
-        // already cached?
-        const cached = safeFiniteSeconds(durationsByItemId[itemId]);
-        if (cached != null) continue;
+        want.add(itemId);
 
-        // probe from the exact preview URL you're rendering
-        const previewUrl = objectUrls[itemId] || (f?.sourceType === "url" ? String(f?.url || "") : "");
-        if (!previewUrl) continue;
+        // keep stable URL while progress updates come in
+        if (nextMap[itemId] && nextMeta[itemId] === clientFileId) continue;
 
         try {
-          const kind = isProbablyVideoDraftFile(f) ? "video" : "audio";
-          const d = await probeDurationSecondsFromSrc({ src: previewUrl, kind });
-          if (d != null) next[itemId] = d;
+          const blob = await getLocalMedia(scope, thread.id, clientFileId);
+          if (!blob) continue;
+
+          if (nextMap[itemId]) {
+            try { URL.revokeObjectURL(nextMap[itemId]); } catch {}
+          }
+
+          nextMap[itemId] = URL.createObjectURL(blob);
+          nextMeta[itemId] = clientFileId;
         } catch {}
       }
 
-      if (cancelled) return;
-      if (Object.keys(next).length) {
-        setDurationsByItemId((prev) => ({ ...(prev || {}), ...next }));
+      // cleanup removed items
+      for (const itemId of Object.keys(nextMap)) {
+        if (want.has(itemId)) continue;
+        try { URL.revokeObjectURL(nextMap[itemId]); } catch {}
+        delete nextMap[itemId];
+        delete nextMeta[itemId];
       }
+
+      if (cancelled) return;
+
+      objectUrlsRef.current = nextMap;
+      objectUrlMetaRef.current = nextMeta;
+      setObjectUrls(nextMap);
     })();
 
     return () => {
       cancelled = true;
     };
-    // include durationsByItemId so we don't re-probe items we just cached
-  }, [readyFiles, objectUrls, durationsByItemId]);
+  }, [thread?.id, scope, filesPreviewKey]);
+
 
 
   const busyUploading = useMemo(() => {
@@ -1228,6 +1214,13 @@ useEffect(() => {
               const isAudio = String(f?.local?.mime || "").startsWith("audio/");
               const isPlaying = String(playingId || "") === String(f.itemId || "");
 
+              const uploadPct = Number(f?.uploadPct);
+              const pctOk = Number.isFinite(uploadPct) && uploadPct >= 0 && uploadPct <= 100;
+
+              const uploadStageRaw = String(f?.uploadStage || "").trim();
+              // avoid showing boring "uploading" twice
+              const uploadStage = uploadStageRaw && uploadStageRaw !== "uploading" ? uploadStageRaw : "";
+
               const stageLabel =
                 f.stage === "uploaded"
                   ? "Uploaded (mp3)"
@@ -1238,6 +1231,15 @@ useEffect(() => {
                   : f.stage === "linked"
                   ? "Linked"
                   : f.stage || "Draft";
+
+              // ✅ live extra for uploads (optional)
+              const stageExtra =
+                String(f.stage) === "uploading" && (uploadStage || pctOk)
+                  ? ` (${[uploadStage || null, pctOk ? `${Math.round(uploadPct)}%` : null].filter(Boolean).join(" ")})`
+                  : "";
+
+              const stageLabelUi = `${stageLabel}${stageExtra}`;
+
 
               const onDelete = async () => {
                 try {
@@ -1277,26 +1279,29 @@ useEffect(() => {
                             if (String(playingId) === String(f.itemId)) setPlayingId(null);
                           }}
                         />
-                      ) : isAudio ? (
-                        isPlaying ? (
-                          <AudioWrap>
-                            <AudioPlayer
-                              ref={(el) => {
-                                if (el) mediaRefs.current[f.itemId] = el;
-                                else delete mediaRefs.current[f.itemId];
-                              }}
-                              src={previewUrl}
-                              controls
-                              preload="metadata"
-                              onEnded={() => {
-                                if (String(playingId) === String(f.itemId)) setPlayingId(null);
-                              }}
-                            />
-                          </AudioWrap>
-                        ) : (
-                          <AudioBadge>audio</AudioBadge>
-                        )
-                      ) : (
+                      ) 
+              : isAudio ? (
+                <AudioWrap>
+                  <AudioPlayer
+                    ref={(el) => {
+                      if (el) mediaRefs.current[f.itemId] = el;
+                      else delete mediaRefs.current[f.itemId];
+                    }}
+                    src={previewUrl}
+                    controls={isPlaying}
+                    preload="metadata"
+                    onEnded={() => {
+                      if (String(playingId) === String(f.itemId)) setPlayingId(null);
+                    }}
+                  />
+                  {!isPlaying ? (
+                    <AudioBadge style={{ position: "absolute", inset: 0 }}>
+                      audio
+                    </AudioBadge>
+                  ) : null}
+                </AudioWrap>
+              ) : (
+
                         <LinkBadge>link</LinkBadge>
                       )
                     ) : (
@@ -1322,7 +1327,7 @@ useEffect(() => {
                     <Name title={f?.local?.name || f?.audio?.b2?.filename || f?.url || ""}>
                       {f?.local?.name || f?.audio?.b2?.filename || f?.url || "Media"}
                     </Name>
-                    <Sub>{stageLabel}</Sub>
+                    <Sub>{stageLabelUi}</Sub>
                   </Meta>
                 </Card>
               );
@@ -1579,13 +1584,14 @@ const VideoPlayer = styled.video`
   display: block;
 `;
 
-const AudioWrap = styled.div`
-  height: 100%;
-  width: 100%;
-  display: grid;
-  place-items: center;
-  padding: 10px;
-`;
+  const AudioWrap = styled.div`
+    position: relative;
+    height: 100%;
+    width: 100%;
+    display: grid;
+    place-items: center;
+    padding: 10px;
+  `;
 
 const AudioPlayer = styled.audio`
   width: 100%;
