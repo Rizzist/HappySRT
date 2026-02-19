@@ -136,30 +136,21 @@ export default async function handler(req, res) {
       const planInfo = planInfoFromPlan(freePlan, freeKey);
 
       res.setHeader("Cache-Control", "no-store");
-      return res.status(200).json({
+        return res.status(200).json({
         ok: true,
-        tokensHydrated: true,
-
+        tokensHydrated: false, // important: let client fall back to /api/auth/tokens
         userId: uid,
         hasSubscription: false,
         subscriptionId: null,
         subscriptionStatus: null,
-
         ...planInfo,
-
         appliedTopup: 0,
         periodStart: null,
         periodEnd: null,
-
-        // No token changes here (webhooks later). But we still return 0s if you want:
-        // (If you prefer: omit token fields entirely in the no-sub path.)
-        mediaTokensBalance: 0,
-        mediaTokensReserved: 0,
-        mediaTokens: 0,
-
-        note: "No active subscription found for this user (or planKey missing).",
+        note: "No active subscription found for this user.",
         serverTime: new Date().toISOString(),
-      });
+        });
+
     }
 
     const plan =

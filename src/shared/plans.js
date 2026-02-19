@@ -98,7 +98,7 @@ const PLANS = Object.freeze([
     },
     entitlements: {
       // Keep this small; your existing /api/auth/tokens bootstrap_min can still apply on top.
-      monthlyFloorMediaTokens: 50,
+      monthlyFloorMediaTokens: 100,
         threadLimit: 2,
       maxFileBytes: mb(100),
       monthlyUploadBytesCap: mb(512),

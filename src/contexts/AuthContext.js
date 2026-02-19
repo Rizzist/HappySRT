@@ -159,38 +159,28 @@ export function AuthProvider({ children }) {
     setOptimisticReservedByKey({});
   };
 
-  const applyTokensSnapshot = useCallback((snap) => {
-    if (!snap || typeof snap !== "object") return;
+const applyTokensSnapshot = useCallback((snap) => {
+  if (!snap || typeof snap !== "object") return;
 
-    let anyTokenField = false;
+  const hasTokenFields =
+    hasOwn(snap, "mediaTokens") ||
+    hasOwn(snap, "mediaTokensBalance") ||
+    hasOwn(snap, "mediaTokensReserved");
 
-    setTokens((prev) => {
-      const next = { ...(prev || {}) };
+  setTokens((prev) => {
+    const next = { ...(prev || {}) };
+    if (hasOwn(snap, "mediaTokens")) next.mediaTokens = Number(snap.mediaTokens || 0) || 0;
+    if (hasOwn(snap, "mediaTokensBalance")) next.mediaTokensBalance = Number(snap.mediaTokensBalance || 0) || 0;
+    if (hasOwn(snap, "mediaTokensReserved")) next.mediaTokensReserved = Number(snap.mediaTokensReserved || 0) || 0;
+    if (hasOwn(snap, "provider")) next.provider = snap.provider || null;
+    if (hasOwn(snap, "pricingVersion")) next.pricingVersion = snap.pricingVersion || null;
+    if (hasOwn(snap, "serverTime")) next.serverTime = snap.serverTime || null;
+    return next;
+  });
 
-      if (hasOwn(snap, "mediaTokens")) {
-        next.mediaTokens = Number(snap.mediaTokens || 0) || 0;
-        anyTokenField = true;
-      }
-      if (hasOwn(snap, "mediaTokensBalance")) {
-        next.mediaTokensBalance = Number(snap.mediaTokensBalance || 0) || 0;
-        anyTokenField = true;
-      }
-      if (hasOwn(snap, "mediaTokensReserved")) {
-        next.mediaTokensReserved = Number(snap.mediaTokensReserved || 0) || 0;
-        anyTokenField = true;
-      }
-      if (hasOwn(snap, "provider")) next.provider = snap.provider || null;
-      if (hasOwn(snap, "pricingVersion")) next.pricingVersion = snap.pricingVersion || null;
-      if (hasOwn(snap, "serverTime")) next.serverTime = snap.serverTime || null;
+  if (snap.tokensHydrated === true || hasTokenFields) setTokensHydrated(true);
+}, []);
 
-      return next;
-    });
-
-    // mark hydrated if server says so OR if we received actual token fields
-    if (snap.tokensHydrated === true || anyTokenField) {
-      setTokensHydrated(true);
-    }
-  }, []);
 
   const applyBillingSnapshot = useCallback((snap) => {
     if (!snap || typeof snap !== "object") return;
@@ -221,12 +211,35 @@ export function AuthProvider({ children }) {
     return appwriteRef.current.account;
   }, []);
 
+  const ensureSession = useCallback(async () => {
+  const account = getAccount();
+
+  try {
+    const u = await account.get();
+    return u || null;
+  } catch {
+    // No session -> create anonymous session
+    try {
+      await account.createAnonymousSession();
+      const u = await account.get();
+      return u || null;
+    } catch {
+      return null;
+    }
+  }
+}, [getAccount]);
+
+
   const refreshUser = useCallback(async () => {
     const account = getAccount();
     try {
       const u = await account.get();
       setUser(u || null);
-      setIsAnonymous(!u?.$id);
+      const s = await account.getSession("current").catch(() => null);
+      const provider = String(s?.provider || "").toLowerCase().trim();
+      const anon = provider === "anonymous";
+      setIsAnonymous(anon || !u?.$id);
+
       return u || null;
     } catch {
       setUser(null);
@@ -235,26 +248,38 @@ export function AuthProvider({ children }) {
     }
   }, [getAccount]);
 
-  const getJwt = useCallback(async ({ force } = {}) => {
-    if (typeof window === "undefined") return null;
-    const account = getAccount();
+const getJwt = useCallback(async ({ force } = {}) => {
+  if (typeof window === "undefined") return null;
 
-    const now = Date.now();
-    const cached = jwtCacheRef.current || {};
-    if (!force && cached.jwt && now - (cached.at || 0) < 3 * 60 * 1000) {
-      return cached.jwt;
-    }
+  const account = getAccount();
+  const now = Date.now();
 
+  const cached = jwtCacheRef.current || {};
+  if (!force && cached.jwt && now - (cached.at || 0) < 3 * 60 * 1000) {
+    return cached.jwt;
+  }
+
+  async function mint() {
+    const r = await account.createJWT();
+    const jwt = r?.jwt ? String(r.jwt) : null;
+    jwtCacheRef.current = { jwt: jwt || null, at: Date.now() };
+    return jwt || null;
+  }
+
+  try {
+    return await mint();
+  } catch {
+    // ✅ no session -> create anonymous and retry
     try {
-      const r = await account.createJWT();
-      const jwt = r?.jwt ? String(r.jwt) : null;
-      jwtCacheRef.current = { jwt: jwt || null, at: now };
-      return jwt || null;
+      await ensureSession(); // <-- uses createAnonymousSession if needed
+      return await mint();
     } catch {
-      jwtCacheRef.current = { jwt: null, at: now };
+      jwtCacheRef.current = { jwt: null, at: Date.now() };
       return null;
     }
-  }, [getAccount]);
+  }
+}, [getAccount, ensureSession]);
+
 
   function getProviderFromSession(s) {
     return String(s?.provider || "").toLowerCase().trim();
@@ -277,37 +302,31 @@ export function AuthProvider({ children }) {
   }, [getAccount]);
 
   // Throttled tokens refresh
-  const refreshTokens = useCallback(
-    async ({ forceJwt, force } = {}) => {
-      if (isAnonymous) return null;
+const refreshTokens = useCallback(async ({ forceJwt, force } = {}) => {
+  const now = Date.now();
+  const state = tokensFetchRef.current || {};
 
-      const now = Date.now();
-      const state = tokensFetchRef.current || {};
+  if (!force && state.inflight) return state.inflight;
+  if (!force && state.at && now - state.at < 3000) return null;
 
-      if (!force && state.inflight) return state.inflight;
-      if (!force && state.at && now - state.at < 3000) return null;
+  const p = (async () => {
+    const jwt = await getJwt({ force: !!forceJwt });
+    if (!jwt) return null;
 
-      const p = (async () => {
-        const jwt = await getJwt({ force: !!forceJwt });
-        if (!jwt) return null;
+    const data = await fetchTokensWithJwt(jwt);
+    if (data && typeof data === "object") applyTokensSnapshot(data);
+    return data;
+  })();
 
-        const data = await fetchTokensWithJwt(jwt);
-        if (data && typeof data === "object") {
-          applyTokensSnapshot(data);
-        }
-        return data;
-      })();
+  tokensFetchRef.current = { inflight: p, at: now };
 
-      tokensFetchRef.current = { inflight: p, at: now };
+  try {
+    return await p;
+  } finally {
+    tokensFetchRef.current = { inflight: null, at: Date.now() };
+  }
+}, [getJwt, applyTokensSnapshot]);
 
-      try {
-        return await p;
-      } finally {
-        tokensFetchRef.current = { inflight: null, at: Date.now() };
-      }
-    },
-    [isAnonymous, getJwt, applyTokensSnapshot]
-  );
 
   // Stripe billing sync (throttled)
   const syncBilling = useCallback(
@@ -339,7 +358,16 @@ export function AuthProvider({ children }) {
         if (data && typeof data === "object") {
           // billing contains plan info + (often) token snapshot too
           applyBillingSnapshot(data);
-          applyTokensSnapshot(data); // sets tokensHydrated too
+
+          const hasTokenFields =
+            hasOwn(data, "mediaTokens") ||
+            hasOwn(data, "mediaTokensBalance") ||
+            hasOwn(data, "mediaTokensReserved");
+
+          if (hasTokenFields) {
+            applyTokensSnapshot(data);
+          }
+
         }
         return data;
       })();
@@ -360,35 +388,40 @@ export function AuthProvider({ children }) {
 
   // Boot: restore session then sync billing (preferred), fallback to /tokens
   useEffect(() => {
-    let alive = true;
-    (async () => {
-      setLoadingAuth(true);
-      try {
-        const u = await refreshUser();
-        if (!alive) return;
+  let alive = true;
 
-        if (u?.$id) {
-          let sync = null;
-          try {
-            sync = await syncBilling({ force: true });
-          } catch {}
+  (async () => {
+    setLoadingAuth(true);
+    try {
+      const account = getAccount();
 
-          // If billing sync didn't hydrate tokens, fallback to tokens endpoint.
-          // (Also helpful if you choose to omit token fields in free/no-sub path.)
-          if (!sync || sync.tokensHydrated !== true) {
-            await refreshTokens({ forceJwt: true, force: true });
-          }
+      // Ensure we have *some* session (anonymous or real)
+      await ensureSession();
+
+      // ✅ actually set user + isAnonymous from Appwrite
+      const u = await refreshUser();
+      if (!alive) return;
+
+      if (u?.$id) {
+        // Optional: only try billing sync for non-anon
+        let sync = null;
+        if (!String((await account.getSession("current").catch(() => null))?.provider || "")
+              .toLowerCase().includes("anonymous")) {
+          try { sync = await syncBilling({ force: true }); } catch {}
         }
-      } finally {
-        if (alive) setLoadingAuth(false);
-      }
-    })();
 
-    return () => {
-      alive = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+        if (!sync || sync.tokensHydrated !== true) {
+          await refreshTokens({ forceJwt: true, force: true });
+        }
+      }
+    } finally {
+      if (alive) setLoadingAuth(false);
+    }
+  })();
+
+  return () => { alive = false; };
+}, []);
+
 
   // Post-auth sync
   const postAuthRef = useRef({ uid: "", at: 0 });
@@ -413,43 +446,53 @@ export function AuthProvider({ children }) {
     })();
   }, [user?.$id, isAnonymous, syncBilling, refreshTokens]);
 
-  const logout = useCallback(async () => {
-    try {
-      const account = getAccount();
-      await account.deleteSessions();
-    } catch {}
+const logout = useCallback(async () => {
+  const account = getAccount();
 
-    jwtCacheRef.current = { jwt: null, at: 0 };
-    tokensFetchRef.current = { inflight: null, at: 0 };
-    billingSyncRef.current = { inflight: null, at: 0, key: "", lastData: null };
+  try {
+    await account.deleteSessions(); // kills google + anon, everything
+  } catch {}
 
-    setUser(null);
-    setIsAnonymous(true);
-    setTokensHydrated(false);
-    setOptimisticReservedByKey({});
+  // Clear client caches/state
+  jwtCacheRef.current = { jwt: null, at: 0 };
+  tokensFetchRef.current = { inflight: null, at: 0 };
+  billingSyncRef.current = { inflight: null, at: 0, key: "", lastData: null };
 
-    setTokens({
-      mediaTokens: 0,
-      mediaTokensBalance: 0,
-      mediaTokensReserved: 0,
-      provider: null,
-      pricingVersion: null,
-      serverTime: null,
-    });
+  setUser(null);
+  setIsAnonymous(true);
+  setTokensHydrated(false);
+  setOptimisticReservedByKey({});
 
-    setBilling({
-      planKey: "free",
-      planName: "free",
-      monthlyFloor: 0,
-      pricingVersion: null,
-      hasSubscription: false,
-      subscriptionId: null,
-      subscriptionStatus: null,
-      periodStart: null,
-      periodEnd: null,
-      serverTime: null,
-    });
-  }, [getAccount]);
+  setTokens({
+    mediaTokens: 0,
+    mediaTokensBalance: 0,
+    mediaTokensReserved: 0,
+    provider: null,
+    pricingVersion: null,
+    serverTime: null,
+  });
+
+  setBilling({
+    planKey: "free",
+    planName: "free",
+    monthlyFloor: 0,
+    pricingVersion: null,
+    hasSubscription: false,
+    subscriptionId: null,
+    subscriptionStatus: null,
+    periodStart: null,
+    periodEnd: null,
+    serverTime: null,
+  });
+
+  // ✅ Create guest session right away
+  await ensureSession();
+  await refreshUser();
+
+  // ✅ Hydrate tokens for the new guest user (works because getJwt self-heals)
+  await refreshTokens({ forceJwt: true, force: true });
+}, [getAccount, ensureSession, refreshUser, refreshTokens]);
+
 
   const tokenSnapshot = {
     mediaTokens: tokens.mediaTokens,

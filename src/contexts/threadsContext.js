@@ -1034,8 +1034,9 @@ const [creatingThread, setCreatingThread] = useState(false);
   }, [activeId]);
 
   const scope = useMemo(() => {
-    if (isAnonymous) return "guest";
-    return user?.$id ? String(user.$id) : null;
+    const uid = user?.$id ? String(user.$id) : null;
+    if (!uid) return null;
+    return isAnonymous ? `anon:${uid}` : `user:${uid}`;
   }, [user?.$id, isAnonymous]);
 
   const bootedRef = useRef(false);
@@ -1062,7 +1063,6 @@ const [creatingThread, setCreatingThread] = useState(false);
   };
 
   const getJwtIfAny = async () => {
-    if (isAnonymous) return null;
     if (!getJwt) return null;
     const jwt = await getJwt();
     return jwt || null;
@@ -1151,6 +1151,26 @@ const [creatingThread, setCreatingThread] = useState(false);
     setWsStatus("disconnected");
     setWsError(null);
   };
+
+  useEffect(() => {
+  if (!scope) return;
+
+  // kill any previous WS connection immediately
+  disconnectWs();
+
+  // reset in-memory state so we don’t try to connect to an old thread id
+  setLiveRunsByThread({});
+  setThreadsById({});
+  setActiveIdState("default");
+
+  threadsRef.current = {};
+  activeRef.current = "default";
+  syncRef.current = { indexAt: null };
+
+  setWsError(null);
+  setWsStatus("disconnected");
+}, [scope]);
+
 
   // =========================
   // Optimistic reservation bookkeeping
@@ -2306,9 +2326,8 @@ return;
   const localThread = makeNewThread(`Thread ${new Date().toLocaleString()}`);
 
   const promise = (async () => {
-    if (!isAnonymous) {
       const jwt = await getJwtIfAny();
-      if (!jwt) throw new Error("Unable to create JWT");
+        if (!jwt) throw new Error("No session/JWT (guest cookies likely blocked)");
 
       const r = await apiCreateThread(jwt, {
         threadId: localThread.id,
@@ -2327,7 +2346,6 @@ return;
           draftRev: serverThread.draftRev ?? null,
         });
       }
-    }
 
     const cur = threadsRef.current || {};
     const next = { ...cur, [localThread.id]: localThread };

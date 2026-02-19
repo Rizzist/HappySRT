@@ -23,7 +23,17 @@ export default async function handler(req, res) {
     if (!uid) return res.status(401).json({ message: "Unauthorized" });
 
     const providerNorm = normalizeProvider(provider);
-    const desiredMin = Number(mediaTokensMin || 0) || (providerNorm === "google" ? 50 : 5);
+
+    // server-authoritative defaults (NOT from request)
+    const DEFAULT_MIN_ANON = 20;
+    const DEFAULT_MIN_GOOGLE = 100;
+    const DEFAULT_MIN_OTHER = 20;
+
+    const desiredMin =
+      providerNorm === "google" ? DEFAULT_MIN_GOOGLE :
+      providerNorm === "anonymous" ? DEFAULT_MIN_ANON :
+      DEFAULT_MIN_OTHER;
+
 
     const client = await pool.connect();
     try {

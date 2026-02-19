@@ -87,10 +87,10 @@ export default function ChatMediaPlayer({ threadId, item, media, onTime, onApi, 
   const { user, isAnonymous } = useAuth();
   const { requestMediaUrl, wsStatus } = useThreads();
 
-  const scope = useMemo(() => {
-    if (isAnonymous) return "guest";
-    return user?.$id ? String(user.$id) : null;
-  }, [user?.$id, isAnonymous]);
+    const scope = useMemo(() => {
+      const uid = String(user?.$id || "").trim();
+      return uid || "guest"; // ✅ anonymous gets its own stable scope as long as cookie/session persists
+    }, [user?.$id]);
 
   const chatItemId = String(item?.chatItemId || "");
   const mimeHint = String(media?.mime || "");
