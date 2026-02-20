@@ -100,8 +100,8 @@ const Card = styled.div`
   align-items: center;
   gap: 10px;
 
-  @media(max-width: 786px){
-    width: 280px;
+  @media(max-width: 500px){
+    width: 320px;
   }
 `;
 

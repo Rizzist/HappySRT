@@ -117,20 +117,21 @@ export default function ThreadView({
         ) : hasChatItems ? (
           <ChatTimeline thread={thread} showEmpty={false} />
         ) : (
-          <Empty>
-            <EmptyCard>
-              <EmptyTitle>Drop a file to get started</EmptyTitle>
-              <EmptySub>
-                Choose what you want: transcription, translation, summarization — or any combo.
-              </EmptySub>
+<Empty>
+  <EmptyCard>
+    <EmptyTitle>Drop a file to get started</EmptyTitle>
+    <EmptySub>
+      Upload audio/video (or paste a media URL) to run transcription, translation, and/or summarization.
+    </EmptySub>
 
-              <EmptyHints>
-                <li>Audio/video supported (later: Backblaze B2 + links)</li>
-                <li>Runs will show up here like messages</li>
-                <li>We’ll wire models/providers next</li>
-              </EmptyHints>
-            </EmptyCard>
-          </Empty>
+    <EmptyHints>
+      <li>Use + New thread to keep projects organized</li>
+      <li>Runs and results will show up here</li>
+      <li>Export anytime: SRT or text</li>
+    </EmptyHints>
+  </EmptyCard>
+</Empty>
+
         )}
       </Body>
 
@@ -291,6 +292,7 @@ const EmptyCard = styled.div`
   border: 1px solid var(--border);
   box-shadow: var(--shadow);
   padding: 18px;
+  max-width: calc(min(80%, 720px));
 `;
 
 const EmptyTitle = styled.div`
