@@ -4,7 +4,7 @@ import { AuthProvider } from "../contexts/AuthContext";
 import { ThreadsProvider } from "@/contexts/threadsContext";
 import { FfmpegProvider } from "../contexts/FfmpegContext";
 import { createGlobalStyle } from "styled-components";
-
+import Script from "next/script";
 const GlobalStyle = createGlobalStyle`
   :root{
     --bg:#ffffff;
@@ -39,6 +39,13 @@ export default function App({ Component, pageProps }) {
               <meta name="theme-color" content="#ffffff" />
               <link rel="apple-touch-icon" href="/icons/icon-192.png" />
             </Head>
+            <Script
+              defer 
+              data-website-id="dfid_xqVIlCaGEnOvUZxpsNuLc" 
+              data-domain="happysrt.com" 
+              data-allow-localhost="true"
+              src="https://datafa.st/js/script.js"> 
+              </Script>
           <Component {...pageProps} />
         </ThreadsProvider>
       </FfmpegProvider>
