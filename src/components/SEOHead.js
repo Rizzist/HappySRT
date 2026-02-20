@@ -1,4 +1,5 @@
 import Head from "next/head";
+import Script from "next/script";
 
 export default function SEOHead({
   title,
@@ -43,6 +44,13 @@ export default function SEOHead({
       <title>{finalTitle}</title>
       <meta name="description" content={finalDesc} />
       <link rel="canonical" href={url} />
+
+        <Script
+        defer
+        data-website-id="dfid_xqVIlCaGEnOvUZxpsNuLc"
+        data-domain="happysrt.com"
+        src="https://datafa.st/js/script.js">
+        </Script>
 
       {/* Robots */}
       <meta
