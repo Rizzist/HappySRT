@@ -99,6 +99,10 @@ const Card = styled.div`
   flex-direction: column;
   align-items: center;
   gap: 10px;
+
+  @media(max-width: 786px){
+    width: 280px;
+  }
 `;
 
 const Logo = styled.img`

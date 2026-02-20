@@ -628,6 +628,11 @@ const SRTEditorWrapper = styled.div`
   gap: 10px;
   padding: 8px;
   min-height: 240px;
+
+  @media(max-width: 786px){
+    gap: 8px;
+    padding: 6px;
+  }
 `;
 
 const EmptyState = styled.div`
@@ -695,6 +700,10 @@ const SRTItem = styled.div`
   &:hover button.merge-btn {
     display: block;
   }
+
+  @media(max-width: 786px){
+    padding: 2px 4px 4px 8px;
+  }
 `;
 
 const Timestamp = styled.div`
@@ -739,6 +748,10 @@ const Timestamp = styled.div`
   /* bad time format */
   & span[data-bad="1"] {
     color: #b42318;
+  }
+
+  @media(max-width: 786px){
+    font-size: 0.85rem;
   }
 `;
 

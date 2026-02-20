@@ -1,4 +1,3 @@
-// components/ThreadView.js
 import styled from "styled-components";
 import TutorialThread from "./TutorialThread";
 import ThreadComposer from "./ThreadComposer";
@@ -9,7 +8,15 @@ function safeArr(x) {
   return Array.isArray(x) ? x : [];
 }
 
-export default function ThreadView({ thread, loading }) {
+export default function ThreadView({
+  thread,
+  loading,
+
+  showMobileHeaderActions,
+  onOpenSidebar,
+  onCreateThread,
+  creatingThread,
+}) {
   const { renameThread, deleteThread } = useThreads();
 
   if (loading || !thread) {
@@ -20,6 +27,25 @@ export default function ThreadView({ thread, loading }) {
             <Title>Loading…</Title>
             <Sub>Preparing your threads</Sub>
           </Left>
+
+          <Actions>
+            {showMobileHeaderActions && (
+              <>
+                <IconButton type="button" onClick={onOpenSidebar} aria-label="Open sidebar" title="Open sidebar">
+                  ☰
+                </IconButton>
+<NewThreadHeaderButton
+  type="button"
+  onClick={onCreateThread}
+  disabled={!!creatingThread}
+  title={creatingThread ? "Creating…" : "Create a new thread"}
+>
+  {creatingThread ? "Creating…" : "+ New thread"}
+</NewThreadHeaderButton>
+
+              </>
+            )}
+          </Actions>
         </Header>
         <Body />
       </Wrap>
@@ -54,16 +80,35 @@ export default function ThreadView({ thread, loading }) {
           </Sub>
         </Left>
 
-        {!isDefault && (
-          <Right>
-            <SmallButton type="button" onClick={onRename}>
-              Rename
-            </SmallButton>
-            <DangerButton type="button" onClick={onDelete}>
-              Delete
-            </DangerButton>
-          </Right>
-        )}
+        <Actions>
+          {showMobileHeaderActions && (
+            <>
+              <IconButton type="button" onClick={onOpenSidebar} aria-label="Open sidebar" title="Open sidebar">
+                ☰
+              </IconButton>
+<NewThreadHeaderButton
+  type="button"
+  onClick={onCreateThread}
+  disabled={!!creatingThread}
+  title={creatingThread ? "Creating…" : "Create a new thread"}
+>
+  {creatingThread ? "Creating…" : "+ New thread"}
+</NewThreadHeaderButton>
+
+            </>
+          )}
+
+          {!isDefault && (
+            <>
+              <SmallButton type="button" onClick={onRename}>
+                Rename
+              </SmallButton>
+              <DangerButton type="button" onClick={onDelete}>
+                Delete
+              </DangerButton>
+            </>
+          )}
+        </Actions>
       </Header>
 
       <Body>
@@ -110,6 +155,11 @@ const Header = styled.div`
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+
+    @media(max-width: 786px){
+    gap: 8px; 
+    padding: 12px 18px;
+  }
 `;
 
 const Left = styled.div`
@@ -117,14 +167,45 @@ const Left = styled.div`
   flex-direction: column;
   gap: 4px;
   min-width: 0;
+  @media(max-width: 786px){
+    gap: 3px; 
+  }
 `;
 
-const Right = styled.div`
+const Actions = styled.div`
   display: flex;
   gap: 8px;
   flex: 0 0 auto;
 `;
 
+const IconButton = styled.button`
+  width: 36px;
+  height: 36px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--hover);
+  color: var(--text);
+  font-weight: 900;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+
+  &:hover {
+    background: #ededee;
+  }
+
+  &:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+    @media(max-width: 786px) {
+    width: 32px;
+    height: 32px;
+  }
+`;
+
+// keep your existing styles below (Title/Sub/Body/etc)
 const Title = styled.div`
   font-weight: 900;
   font-size: 15px;
@@ -132,11 +213,19 @@ const Title = styled.div`
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+
+    @media(max-width: 786px) {
+    font-size: 14px;
+  }
 `;
 
 const Sub = styled.div`
   font-size: 12px;
   color: var(--muted);
+  @media(max-width: 786px) {
+    font-size: 10px;
+  }
+ 
 `;
 
 const Body = styled.div`
@@ -145,8 +234,48 @@ const Body = styled.div`
   overflow: auto;
   padding: 18px;
   background: var(--bg);
+    @media(max-width: 786px) {
+    padding: 11px;
+  }
+  
 `;
 
+const SmallButton = styled.button`
+  border: 1px solid var(--border);
+  background: var(--hover);
+  color: var(--text);
+  border-radius: 12px;
+  padding: 8px 10px;
+  font-weight: 800;
+  cursor: pointer;
+
+  &:hover {
+    background: #ededee;
+  }
+
+      @media(max-width: 786px) {
+    font-size: 12px;
+  }
+`;
+
+const DangerButton = styled.button`
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--accent);
+  border-radius: 12px;
+  padding: 8px 10px;
+  font-weight: 900;
+  cursor: pointer;
+
+  &:hover {
+    background: rgba(239, 68, 68, 0.14);
+  }
+    @media(max-width: 786px) {
+    font-size: 12px;
+  }
+`;
+
+// (Empty state styles unchanged)
 const Empty = styled.div`
   height: 100%;
   display: grid;
@@ -188,30 +317,44 @@ const EmptyHints = styled.ul`
   }
 `;
 
-const SmallButton = styled.button`
-  border: 1px solid var(--border);
-  background: var(--hover);
-  color: var(--text);
+const NewThreadHeaderButton = styled.button`
   border-radius: 12px;
-  padding: 8px 10px;
-  font-weight: 800;
-  cursor: pointer;
-
-  &:hover {
-    background: #ededee;
-  }
-`;
-
-const DangerButton = styled.button`
   border: 1px solid rgba(239, 68, 68, 0.25);
-  background: rgba(239, 68, 68, 0.1);
+  background: rgba(239, 68, 68, 0.08);
   color: var(--accent);
-  border-radius: 12px;
-  padding: 8px 10px;
   font-weight: 900;
+
+  height: 36px;
+  padding: 0 12px;
+
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+
+  white-space: nowrap;
 
   &:hover {
-    background: rgba(239, 68, 68, 0.14);
+    background: rgba(239, 68, 68, 0.12);
+  }
+
+  &:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+    @media(max-width: 786px) {
+    height: 32px;
+    font-size: 12px;
+  }
+
+  /* optional: if the header gets tight, hide text and keep "+" only */
+  @media (max-width: 360px) {
+    padding: 0 10px;
+
+    /* show only the + on very tiny screens */
+    span {
+      display: none;
+    }
   }
 `;

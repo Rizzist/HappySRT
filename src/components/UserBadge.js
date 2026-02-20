@@ -1,7 +1,6 @@
 // components/UserBadge.js
 import styled, { keyframes } from "styled-components";
 import { useMemo, useRef, useState, useEffect } from "react";
-import UpgradePlansModal from "./UpgradePlansModal";
 import { toast } from "sonner";
 import { onUpgradeRequested } from "../lib/upgradeBus"; // ✅ add
 import { useAuth } from "../contexts/AuthContext";
@@ -61,7 +60,7 @@ function prettyPlanName(planName, planKey) {
   return k || "free";
 }
 
-export default function UserBadge({ onStartCheckout }) {
+export default function UserBadge({ onStartCheckout, onOpenUpgrade }) {
   const {
     user,
     isAnonymous,
@@ -94,9 +93,7 @@ export default function UserBadge({ onStartCheckout }) {
   const isFreePlan = !planKeyNorm || planKeyNorm === "free" || planKeyNorm === "hobby";
   const hasPaidPlan = !isAnonymous && !isFreePlan;
 
-  const [upgradeOpen, setUpgradeOpen] = useState(false);
   const [burst, setBurst] = useState(false);
-  const [busyPlanKey, setBusyPlanKey] = useState("");
 
   const burstTimerRef = useRef(null);
 
@@ -124,7 +121,7 @@ export default function UserBadge({ onStartCheckout }) {
     if (burstTimerRef.current) clearTimeout(burstTimerRef.current);
     burstTimerRef.current = setTimeout(() => setBurst(false), 650);
 
-    setUpgradeOpen(true);
+    onOpenUpgrade?.();
   });
 }, [isAnonymous]);
 
@@ -133,7 +130,7 @@ export default function UserBadge({ onStartCheckout }) {
     setBurst(true);
     if (burstTimerRef.current) clearTimeout(burstTimerRef.current);
     burstTimerRef.current = setTimeout(() => setBurst(false), 650);
-    setUpgradeOpen(true);
+    onOpenUpgrade?.();
   };
 
   const handleMouseMove = (e) => {
@@ -145,22 +142,6 @@ export default function UserBadge({ onStartCheckout }) {
     el.style.setProperty("--my", `${y}%`);
   };
 
-  const handleSelectPlan = async (pk) => {
-    if (typeof onStartCheckout !== "function") {
-      toast("Checkout hook not wired yet (onStartCheckout).");
-      return;
-    }
-
-    try {
-      setBusyPlanKey(String(pk || ""));
-      await onStartCheckout(pk);
-      setUpgradeOpen(false);
-    } catch (e) {
-      toast(e?.message || "Failed to start checkout");
-    } finally {
-      setBusyPlanKey("");
-    }
-  };
 
   return (
     <Wrap>
@@ -228,14 +209,6 @@ export default function UserBadge({ onStartCheckout }) {
           )}
         </Actions>
       </Meta>
-
-      <UpgradePlansModal
-        open={!!upgradeOpen}
-        onClose={() => setUpgradeOpen(false)}
-        onSelectPlan={handleSelectPlan}
-        busyPlanKey={busyPlanKey}
-        onLogout={logout}
-      />
     </Wrap>
   );
 }

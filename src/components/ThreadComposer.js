@@ -5,7 +5,7 @@ import { toast } from "sonner";
 import { useThreads } from "../contexts/threadsContext";
 import { useAuth } from "../contexts/AuthContext";
 import { getLocalMedia } from "../lib/mediaStore";
-
+import { createPortal } from "react-dom";
 import { makeScope } from "@/lib/scopeKey";
 
 import * as CatalogImport from "../shared/transcriptionCatalog";
@@ -207,8 +207,12 @@ function hasConfirmedStart(thread, pendingItemIds) {
 
 function MultiLangSelect({ value, options, onChange, placeholder }) {
   const wrapRef = useRef(null);
+  const btnRef = useRef(null);
+  const menuRef = useRef(null);
+
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
+  const [menuPos, setMenuPos] = useState(null);
 
   const vals = Array.isArray(value) ? value : [];
   const opts = Array.isArray(options) ? options : [];
@@ -279,14 +283,72 @@ function MultiLangSelect({ value, options, onChange, placeholder }) {
     onChange && onChange(Array.from(set));
   };
 
+  // ✅ compute fixed-position menu coords (prevents clipping by overflow parents)
+  const recomputeMenuPos = useMemo(() => {
+    return () => {
+      const btn = btnRef.current;
+      if (!btn || typeof window === "undefined") return;
+
+      const r = btn.getBoundingClientRect();
+      const vw = window.innerWidth || 0;
+      const vh = window.innerHeight || 0;
+
+      const gutter = 8;
+      const maxW = Math.min(420, Math.max(240, vw - gutter * 2));
+
+      let width = Math.min(r.width || 260, maxW);
+      width = Math.max(220, width);
+
+      let left = r.left;
+      left = Math.min(Math.max(gutter, left), Math.max(gutter, vw - width - gutter));
+
+      const below = vh - r.bottom - gutter;
+      const above = r.top - gutter;
+
+      const preferUp = below < 260 && above > below;
+
+      const avail = preferUp ? above : below;
+      const maxHeight = Math.min(520, Math.max(200, avail - gutter));
+
+      const next = preferUp
+        ? { left, width, bottom: Math.max(gutter, vh - r.top + gutter), top: undefined, maxHeight }
+        : { left, width, top: Math.max(gutter, r.bottom + gutter), bottom: undefined, maxHeight };
+
+      setMenuPos(next);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    recomputeMenuPos();
+
+    const onResize = () => recomputeMenuPos();
+    const onScroll = () => recomputeMenuPos();
+
+    window.addEventListener("resize", onResize);
+    // capture scroll events from scrollable parents too (horizontal scrollers etc)
+    window.addEventListener("scroll", onScroll, true);
+
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("scroll", onScroll, true);
+    };
+  }, [open, recomputeMenuPos]);
+
+  // ✅ close on outside click (must include portal menu)
   useEffect(() => {
     if (!open) return;
 
     const onDown = (e) => {
       const t = e?.target;
       if (!t) return;
+
       const w = wrapRef.current;
+      const m = menuRef.current;
+
       if (w && w.contains(t)) return;
+      if (m && m.contains(t)) return;
+
       setOpen(false);
     };
 
@@ -302,11 +364,95 @@ function MultiLangSelect({ value, options, onChange, placeholder }) {
     };
   }, [open]);
 
+  const menu = open ? (
+    <MultiMenu
+      ref={menuRef}
+      role="listbox"
+      aria-label="Target languages"
+      style={{
+        top: menuPos?.top,
+        bottom: menuPos?.bottom,
+        left: menuPos?.left,
+        width: menuPos?.width,
+        maxHeight: menuPos?.maxHeight,
+      }}
+    >
+      <MultiSearch
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+        placeholder="Search languages…"
+        autoFocus
+      />
+
+      <MultiTopbar>
+        <MultiCount>
+          Selected <b>{vals.length}</b> / {allValues.length || opts.length || 0}
+        </MultiCount>
+        <MultiTopActions>
+          <MultiLink type="button" onClick={selectFiltered} title="Add all currently filtered languages">
+            Select filtered
+          </MultiLink>
+          <MultiLink type="button" onClick={selectAll} title="Select all available languages">
+            {allSelected ? "All selected" : "Select all"}
+          </MultiLink>
+        </MultiTopActions>
+      </MultiTopbar>
+
+      {/* ✅ compact closed state: chips are shown only inside the open menu */}
+      {selectedLabels.length ? (
+        <MultiSelectedBar title={selectedLabels.join(", ")}>
+          {selectedLabels.slice(0, 12).map((lbl, i) => (
+            <MultiChip key={`${lbl}|${i}`}>{lbl}</MultiChip>
+          ))}
+          {selectedLabels.length > 12 ? <MultiMore>+{selectedLabels.length - 12}</MultiMore> : null}
+        </MultiSelectedBar>
+      ) : (
+        <MultiSelectedMuted>None selected</MultiSelectedMuted>
+      )}
+
+      <MultiList>
+        {filtered.map((o) => {
+          const v = String(o?.value || "");
+          const lbl = String(o?.label || o?.value || "");
+          const checked = selectedSet.has(v);
+
+          return (
+            <MultiItem key={v} type="button" onClick={() => toggle(v)} $on={checked}>
+              <MultiCheck $on={checked}>{checked ? "✓" : ""}</MultiCheck>
+              <span>{lbl}</span>
+            </MultiItem>
+          );
+        })}
+      </MultiList>
+
+      <MultiFooter>
+        <MultiFooterLeft>
+          <MultiLink type="button" onClick={clearAll}>
+            Clear
+          </MultiLink>
+        </MultiFooterLeft>
+
+        <MultiFooterRight>
+          <MultiLink type="button" onClick={() => setOpen(false)}>
+            Done
+          </MultiLink>
+        </MultiFooterRight>
+      </MultiFooter>
+    </MultiMenu>
+  ) : null;
+
   return (
     <MultiWrap ref={wrapRef} $open={open}>
       <MultiBtn
+        ref={btnRef}
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          setOpen((v) => !v);
+          // keep position accurate right when opening
+          setTimeout(() => {
+            try { recomputeMenuPos(); } catch {}
+          }, 0);
+        }}
         title={selectedLabels.join(", ") || ""}
         aria-expanded={open}
       >
@@ -314,74 +460,11 @@ function MultiLangSelect({ value, options, onChange, placeholder }) {
         <MultiCaret $open={open}>▾</MultiCaret>
       </MultiBtn>
 
-      {/* ✅ Preview targets */}
-      {selectedLabels.length ? (
-        <MultiPreview title={selectedLabels.join(", ")}>
-          {selectedLabels.slice(0, 6).map((lbl, i) => (
-            <MultiChip key={`${lbl}|${i}`}>{lbl}</MultiChip>
-          ))}
-          {selectedLabels.length > 6 ? <MultiMore>+{selectedLabels.length - 6}</MultiMore> : null}
-        </MultiPreview>
-      ) : (
-        <MultiPreviewMuted>None selected</MultiPreviewMuted>
-      )}
-
-      {open ? (
-        <MultiMenu role="listbox" aria-label="Target languages">
-          <MultiSearch
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="Search languages…"
-            autoFocus
-          />
-
-          <MultiTopbar>
-            <MultiCount>
-              Selected <b>{vals.length}</b> / {allValues.length || opts.length || 0}
-            </MultiCount>
-            <MultiTopActions>
-              <MultiLink type="button" onClick={selectFiltered} title="Add all currently filtered languages">
-                Select filtered
-              </MultiLink>
-              <MultiLink type="button" onClick={selectAll} title="Select all available languages">
-                {allSelected ? "All selected" : "Select all"}
-              </MultiLink>
-            </MultiTopActions>
-          </MultiTopbar>
-
-          <MultiList>
-            {filtered.map((o) => {
-              const v = String(o?.value || "");
-              const lbl = String(o?.label || o?.value || "");
-              const checked = selectedSet.has(v);
-
-              return (
-                <MultiItem key={v} type="button" onClick={() => toggle(v)} $on={checked}>
-                  <MultiCheck $on={checked}>{checked ? "✓" : ""}</MultiCheck>
-                  <span>{lbl}</span>
-                </MultiItem>
-              );
-            })}
-          </MultiList>
-
-          <MultiFooter>
-            <MultiFooterLeft>
-              <MultiLink type="button" onClick={clearAll}>
-                Clear
-              </MultiLink>
-            </MultiFooterLeft>
-
-            <MultiFooterRight>
-              <MultiLink type="button" onClick={() => setOpen(false)}>
-                Done
-              </MultiLink>
-            </MultiFooterRight>
-          </MultiFooter>
-        </MultiMenu>
-      ) : null}
+      {open && typeof document !== "undefined" ? createPortal(menu, document.body) : null}
     </MultiWrap>
   );
 }
+
 
 
 
@@ -1535,19 +1618,6 @@ const stageLabel =
 
 /* --- styles --- */
 
-const Dock = styled.div`
-  padding: 16px 18px;
-  border-top: 1px solid var(--border);
-  background: var(--bg);
-  display: flex;
-  justify-content: center;
-`;
-
-const Box = styled.div`
-  width: 100%;
-  max-width: 860px;
-`;
-
 const MediaGrid = styled.div`
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1678,12 +1748,6 @@ const Sub = styled.div`
   white-space: nowrap;
 `;
 
-const TopRow = styled.div`
-  display: grid;
-  grid-template-columns: 44px 1fr 44px 92px;
-  gap: 10px;
-  align-items: center;
-`;
 
 const Attach = styled.label`
   position: relative;
@@ -1708,20 +1772,11 @@ const AttachButton = styled.div`
   place-items: center;
   font-size: 16px;
   box-shadow: var(--shadow);
-`;
 
-const UrlInput = styled.input`
-  height: 44px;
-  border-radius: 14px;
-  border: 1px solid var(--border);
-  background: var(--panel);
-  color: var(--text);
-  padding: 0 14px;
-  outline: none;
-  box-shadow: var(--shadow);
-
-  &::placeholder {
-    color: rgba(107, 114, 128, 0.9);
+  @media(max-width: 786px){
+  width: 32px;
+  height: 32px;
+  font-size: 13px;
   }
 `;
 
@@ -1743,24 +1798,11 @@ const AddUrlButton = styled.button`
     opacity: 0.5;
     cursor: not-allowed;
   }
-`;
 
-const StartButton = styled.button`
-  height: 44px;
-  border-radius: 14px;
-  border: 1px solid rgba(239, 68, 68, 0.25);
-  background: rgba(239, 68, 68, 0.1);
-  color: var(--accent);
-  font-weight: 950;
-  cursor: pointer;
-  box-shadow: var(--shadow);
-
-  &:hover:enabled {
-    background: rgba(239, 68, 68, 0.14);
-  }
-  &:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
+    @media(max-width: 786px){
+  width: 32px;
+  height: 32px;
+  font-size: 13px;
   }
 `;
 
@@ -1785,6 +1827,11 @@ const Pill = styled.button`
 
   &:hover {
     background: ${(p) => (p.$on ? "rgba(239,68,68,0.12)" : "var(--hover)")};
+  }
+
+  @media(max-width: 786px){
+    font-size: 11px;
+    padding: 6px 8px;
   }
 `;
 
@@ -1836,6 +1883,12 @@ const Panel = styled.div`
   display: flex;
   flex-direction: column;
   gap: 12px;
+
+  @media(max-width: 786px){
+      margin-top: 10px;
+      padding: 8px;
+      gap: 8px;
+  }
 `;
 
 const Group = styled.div`
@@ -1843,6 +1896,10 @@ const Group = styled.div`
   background: rgba(0, 0, 0, 0.015);
   border-radius: 14px;
   padding: 10px;
+
+    @media(max-width: 786px){
+      padding: 8px;
+  }
 `;
 
 const GroupTitle = styled.div`
@@ -1850,6 +1907,11 @@ const GroupTitle = styled.div`
   font-size: 12px;
   color: var(--text);
   margin-bottom: 8px;
+
+  @media(max-width: 786px){
+      font-size: 11px;
+      margin-bottom: 6px;
+  }
 `;
 
 const Fields = styled.div`
@@ -1857,9 +1919,7 @@ const Fields = styled.div`
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 
-  @media (max-width: 720px) {
-    grid-template-columns: 1fr;
-  }
+
 `;
 
 const Field = styled.div`
@@ -1872,11 +1932,14 @@ const Label = styled.div`
   font-size: 11px;
   color: var(--muted);
   font-weight: 800;
+   @media(max-width: 786px){
+      font-size: 10px;
+  }
 `;
 
 const Select = styled.select`
-  height: 38px;
-  border-radius: 12px;
+  height: 32px;
+  border-radius: 8px;
   border: 1px solid var(--border);
   background: #fff;
   color: var(--text);
@@ -1886,6 +1949,11 @@ const Select = styled.select`
   &:focus {
     border-color: rgba(239, 68, 68, 0.35);
     box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.1);
+  }
+
+  @media(max-width: 786px){
+      height: 24px;
+      border-radius: 6px;
   }
 `;
 
@@ -1917,8 +1985,10 @@ const TrField = styled.div`
   display: flex;
   flex-direction: column;
   gap: 6px;
+
+  flex: 0 0 170px;     /* fixed-ish columns */
   min-width: 170px;
-  flex: 0 0 auto;
+  max-width: 170px;
 `;
 
 const TrFields = styled.div`
@@ -1927,62 +1997,26 @@ const TrFields = styled.div`
   align-items: flex-end;
   flex-wrap: nowrap;
 
+  max-width: 100%;
+  min-width: 0;        /* ✅ critical: allow inner items to shrink */
+
   overflow-x: auto;
-  overflow-y: visible; /* ✅ key: don't clip dropdown vertically */
+  overflow-y: visible;
   padding-bottom: 2px;
+  padding-right: 12px; /* ✅ keeps last control from looking “cut” at edge */
 
   -webkit-overflow-scrolling: touch;
   scrollbar-width: thin;
 `;
 
-
 const TrFieldGrow = styled(TrField)`
-  min-width: 240px;
-  flex: 1 1 320px;
+  flex: 1 1 0;         /* ✅ take remaining space but can shrink */
+  min-width: 0;        /* ✅ critical for flex overflow */
+  max-width: 100%;
 `;
 
-// ✅ Multi-select dropdown (matches your Select visual language)
 
 
-const MultiBtn = styled.button`
-  height: 38px;
-  width: 100%;
-  border-radius: 12px;
-  border: 1px solid var(--border);
-  background: #fff;
-  color: var(--text);
-  padding: 0 10px;
-  outline: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  cursor: pointer;
-
-  &:focus {
-    border-color: rgba(239, 68, 68, 0.35);
-    box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.1);
-  }
-
-  &:hover {
-    background: var(--hover);
-  }
-`;
-
-const MultiBtnText = styled.span`
-  font-weight: 900;
-  font-size: 12px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-`;
-
-const MultiCaret = styled.span`
-  font-size: 12px;
-  opacity: 0.75;
-  transform: ${(p) => (p.$open ? "rotate(180deg)" : "rotate(0deg)")};
-  transition: transform 0.12s ease;
-`;
 
 const MultiSearch = styled.input`
   width: 100%;
@@ -1995,6 +2029,7 @@ const MultiSearch = styled.input`
   color: var(--text);
   font-weight: 900;
   font-size: 12px;
+  min-height: 30px;
 
   &::placeholder {
     color: var(--muted);
@@ -2057,26 +2092,27 @@ const MultiLink = styled.button`
 
 
 
-const MultiWrap = styled.div`
-  position: relative;
 
-  /* ✅ THIS is the “increase height by ~100” fix when opened */
-  margin-bottom: ${(p) => (p.$open ? "110px" : "0")};
-`;
 
 const MultiMenu = styled.div`
-  position: absolute;
-  z-index: 9999;
-  top: calc(100% + 8px);
-  left: 0;
-  width: 100%;
-  min-width: 260px;
+  position: fixed;
+  z-index: 20000;
+
   border-radius: 14px;
   border: 1px solid var(--border);
   background: var(--panel);
   box-shadow: 0 14px 34px rgba(0, 0, 0, 0.16);
   overflow: hidden;
+
+  /* layout */
+  display: flex;
+  flex-direction: column;
+
+  /* safety on tiny screens */
+  max-width: min(420px, calc(100vw - 16px));
 `;
+
+
 
 const MultiTopbar = styled.div`
   display: flex;
@@ -2086,6 +2122,11 @@ const MultiTopbar = styled.div`
   padding: 8px 10px;
   border-bottom: 1px solid var(--border);
   background: rgba(0, 0, 0, 0.01);
+
+  @media(max-width: 786px){
+  gap: 8px;
+  padding: 6px 8px;
+  }
 `;
 
 const MultiCount = styled.div`
@@ -2103,13 +2144,19 @@ const MultiTopActions = styled.div`
   display: inline-flex;
   align-items: center;
   gap: 10px;
+
+  @media(max-width: 786px){
+  gap: 8px;
+  }
 `;
 
 const MultiList = styled.div`
-  max-height: 320px; /* ✅ a bit taller */
+  flex: 1 1 auto;
   overflow: auto;
   padding: 6px;
+  min-height: 140px;
 `;
+
 
 const MultiFooter = styled.div`
   display: flex;
@@ -2119,18 +2166,29 @@ const MultiFooter = styled.div`
   padding: 8px 10px;
   border-top: 1px solid var(--border);
   background: rgba(0, 0, 0, 0.01);
+
+  @media(max-width: 786px){
+  gap: 8px;
+  padding: 6px 8px;
+  }
 `;
 
 const MultiFooterLeft = styled.div`
   display: inline-flex;
   align-items: center;
   gap: 10px;
+  @media(max-width: 786px){
+  gap: 8px;
+  }
 `;
 
 const MultiFooterRight = styled.div`
   display: inline-flex;
   align-items: center;
   gap: 10px;
+  @media(max-width: 786px){
+  gap: 8px;
+  }
 `;
 
 /* ✅ Preview row under the button */
@@ -2140,6 +2198,9 @@ const MultiPreview = styled.div`
   flex-wrap: wrap;
   gap: 6px;
   align-items: center;
+  @media(max-width: 786px){
+  margin-top: 4px;
+  }
 `;
 
 const MultiPreviewMuted = styled.div`
@@ -2158,6 +2219,11 @@ const MultiChip = styled.span`
   border: 1px solid var(--border);
   background: rgba(0, 0, 0, 0.02);
   white-space: nowrap;
+
+  @media(max-width: 786px){
+  font-size: 10px;
+  padding: 2px 6px;
+  }
 `;
 
 const MultiMore = styled.span`
@@ -2197,4 +2263,198 @@ const PillMiniBadge = styled.span`
         : "rgba(255,255,255,0.55)"};
 
   color: ${(p) => (p.$state === "unknown" ? "var(--muted)" : "var(--text)")};
+`;
+
+
+
+
+
+
+
+
+
+
+
+
+
+const TopRow = styled.div`
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) 44px 92px;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+
+  @media (max-width: 520px) {
+    grid-template-columns: 32px minmax(0, 1fr) 32px 80px;
+    gap: 10px;
+  }
+`;
+
+const UrlInput = styled.input`
+  height: 44px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  padding: 0 14px;
+  outline: none;
+  box-shadow: var(--shadow);
+
+  width: 100%;
+  min-width: 0; /* ✅ critical: allow shrinking */
+
+  &::placeholder {
+    color: rgba(107, 114, 128, 0.9);
+  }
+
+  @media(max-width: 786px){
+      height: 32px;
+      font-size: 0.75rem;
+  }
+`;
+
+const StartButton = styled.button`
+  height: 44px;
+  border-radius: 14px;
+  border: 1px solid rgba(239, 68, 68, 0.25);
+  background: rgba(239, 68, 68, 0.1);
+  color: var(--accent);
+  font-weight: 950;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+
+  min-width: 0; /* ✅ */
+
+  &:hover:enabled {
+    background: rgba(239, 68, 68, 0.14);
+  }
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+  }
+
+  @media(max-width: 786px){
+      height: 32px;
+      font-size: 0.75rem;
+  }
+`;
+
+
+const Dock = styled.div`
+  padding: 16px 18px;
+  border-top: 1px solid var(--border);
+  background: var(--bg);
+  display: flex;
+  justify-content: center;
+
+  min-width: 0;
+  max-width: 100%;
+
+  padding-bottom: calc(16px + env(safe-area-inset-bottom));
+
+  @media (max-width: 520px) {
+    padding: 12px 12px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
+  }
+`;
+
+const Box = styled.div`
+  width: 100%;
+  max-width: 860px;
+
+  min-width: 0;   /* ✅ */
+  max-width: 100%; /* ✅ */
+`;
+
+
+
+
+
+
+
+const MultiSelectedBar = styled.div`
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.01);
+
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+
+  max-height: 64px;
+  overflow: auto;
+`;
+
+const MultiSelectedMuted = styled.div`
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.01);
+
+  font-size: 11px;
+  font-weight: 800;
+  color: var(--muted);
+`;
+
+
+
+
+
+const MultiWrap = styled.div`
+  position: relative;
+  width: 100%;
+  min-width: 0;  /* ✅ allow shrink inside flex */
+`;
+
+const MultiBtn = styled.button`
+  height: 32px;
+  width: 100%;
+  min-width: 0;        /* ✅ allow shrink */
+  overflow: hidden;    /* ✅ keep contents from pushing layout */
+
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #fff;
+  color: var(--text);
+  padding: 0 10px;
+  outline: none;
+
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  cursor: pointer;
+
+  &:focus {
+    border-color: rgba(239, 68, 68, 0.35);
+    box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.1);
+  }
+
+  &:hover {
+    background: var(--hover);
+  }
+
+  @media (max-width: 786px) {
+    height: 24px;
+    border-radius: 6px;
+  }
+`;
+
+const MultiBtnText = styled.span`
+  flex: 1 1 auto;  /* ✅ */
+  min-width: 0;    /* ✅ this is THE ellipsis fix */
+
+  font-weight: 900;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const MultiCaret = styled.span`
+  flex: 0 0 auto;  /* ✅ never shrink caret */
+  font-size: 12px;
+  opacity: 0.75;
+  transform: ${(p) => (p.$open ? "rotate(180deg)" : "rotate(0deg)")};
+  transition: transform 0.12s ease;
 `;

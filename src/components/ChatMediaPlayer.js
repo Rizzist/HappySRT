@@ -477,6 +477,11 @@ const Wrap = styled.div`
   display: flex;
   flex-direction: column;
   gap: 8px;
+
+  @media(max-width: 786px){
+    padding: 6px;
+    gap: 4px;
+  }
 `;
 
 const TopRow = styled.div`
@@ -504,16 +509,25 @@ const Badge = styled.span`
       : p.$kind === "remote"
       ? "rgba(52, 152, 219, 0.12)"
       : "rgba(0,0,0,0.06)"};
+    @media(max-width: 786px) {
+    font-size: 10px;
+  }
 `;
 
 const Meta = styled.span`
   font-size: 11px;
   color: var(--muted);
   font-weight: 800;
+    @media(max-width: 786px) {
+    font-size: 10px;
+  }
 `;
 
 const Audio = styled.audio`
   width: 100%;
+    @media(max-width: 786px) {
+    max-height: 32px;
+  }
 `;
 
 const Video = styled.video`

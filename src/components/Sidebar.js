@@ -3,6 +3,10 @@ import styled from "styled-components";
 import UserBadge from "./UserBadge";
 
 export default function Sidebar({
+  mobile,
+  open,
+  onClose,
+
   collapsed,
   onToggle,
   threads,
@@ -12,19 +16,15 @@ export default function Sidebar({
   creatingThread,
   user,
   isAnonymous,
-
-  // existing
   mediaTokens,
-
-  // step 3
   tokenSnapshot,
   pendingMediaTokens,
-
   onGoogleLogin,
   onLogout,
-
   onStartCheckout,
+  onOpenUpgrade
 }) {
+  const effectiveCollapsed = mobile ? false : collapsed;
   // ---- base available (server snapshot preferred) ----
   const availableRaw =
     tokenSnapshot && typeof tokenSnapshot.mediaTokens === "number"
@@ -74,49 +74,59 @@ export default function Sidebar({
       ? `Media tokens: ${total} (${available} unused, ${pending} in use)`
       : `Media tokens: ${total} (${available} unused)`;
 
-  return (
-    <Wrap $collapsed={collapsed}>
+    return (
+    <Wrap
+      $collapsed={effectiveCollapsed}
+      $mobile={mobile}
+      $open={open}
+      aria-hidden={mobile && !open}
+    >
       <Top>
         <Brand>
           <LogoButton
             type="button"
-            onClick={collapsed ? onToggle : undefined}
-            aria-label={collapsed ? "Expand sidebar" : "Logo"}
-            title={collapsed ? "Expand sidebar" : "HappySRT"}
-            $clickable={collapsed}
+            onClick={effectiveCollapsed ? onToggle : undefined}
+            aria-label={effectiveCollapsed ? "Expand sidebar" : "Logo"}
+            title={effectiveCollapsed ? "Expand sidebar" : "HappySRT"}
+            $clickable={effectiveCollapsed}
           >
             <LogoImg src="/logo.png" alt="HappySRT" />
-            <LogoHoverOverlay $enabled={collapsed}>
+            <LogoHoverOverlay $enabled={effectiveCollapsed}>
               <OverlayIcon aria-hidden="true">»</OverlayIcon>
             </LogoHoverOverlay>
           </LogoButton>
 
-          {!collapsed && <BrandText>HappySRT</BrandText>}
+          {!effectiveCollapsed && <BrandText>HappySRT</BrandText>}
         </Brand>
 
-        {!collapsed && (
-          <CollapseButton
-            type="button"
-            onClick={onToggle}
-            aria-label="Collapse sidebar"
-            title="Collapse sidebar"
-          >
-            «
-          </CollapseButton>
+        {mobile ? (
+          <CloseButton type="button" onClick={onClose} aria-label="Close sidebar" title="Close sidebar">
+            ✕
+          </CloseButton>
+        ) : (
+          !effectiveCollapsed && (
+            <CollapseButton
+              type="button"
+              onClick={onToggle}
+              aria-label="Collapse sidebar"
+              title="Collapse sidebar"
+            >
+              «
+            </CollapseButton>
+          )
         )}
       </Top>
 
-      {!collapsed && (
+      {!effectiveCollapsed && (
         <>
-<NewThreadButton
-  type="button"
-  onClick={onCreateThread}
-  disabled={!!creatingThread}
-  title={creatingThread ? "Creating…" : "Create a new thread"}
->
-  {creatingThread ? "Creating…" : "+ New thread"}
-</NewThreadButton>
-
+          <NewThreadButton
+            type="button"
+            onClick={onCreateThread}
+            disabled={!!creatingThread}
+            title={creatingThread ? "Creating…" : "Create a new thread"}
+          >
+            {creatingThread ? "Creating…" : "+ New thread"}
+          </NewThreadButton>
 
           <NavLabel>Threads</NavLabel>
 
@@ -135,21 +145,22 @@ export default function Sidebar({
         </>
       )}
 
+      {/* Footer stays the same */}
       <Footer>
-        {!collapsed && (
+        {!effectiveCollapsed && (
           <UserBadge
             user={user}
             isAnonymous={isAnonymous}
-            // ✅ pass adjusted "unused" + "in-use" so UserBadge total stays stable
             mediaTokens={available}
             pendingMediaTokens={pending}
             onGoogleLogin={onGoogleLogin}
             onLogout={onLogout}
-            onStartCheckout={onStartCheckout} // ✅
+            onStartCheckout={onStartCheckout}
+            onOpenUpgrade={onOpenUpgrade}
           />
         )}
 
-        {collapsed && (
+        {effectiveCollapsed && (
           <TokenMini title={tokenTitle} aria-label={tokenTitle}>
             <TokenDot $busy={pending > 0} aria-hidden="true" />
             <TokenValue>{total}</TokenValue>
@@ -161,26 +172,7 @@ export default function Sidebar({
   );
 }
 
-const Wrap = styled.aside`
-  width: ${(p) => (p.$collapsed ? "58px" : "250px")};
-  transition: width 180ms ease;
-  background: var(--panel-2);
-  border-right: 1px solid var(--border);
 
-  display: flex;
-  flex-direction: column;
-
-  height: 100vh;
-  height: 100dvh;
-  max-height: 100vh;
-  max-height: 100dvh;
-
-  overflow: hidden;
-
-  padding: 14px;
-  gap: 12px;
-  box-sizing: border-box;
-`;
 
 const Top = styled.div`
   display: flex;
@@ -393,4 +385,61 @@ const TokenPending = styled.div`
   color: rgba(59, 130, 246, 1);
   font-size: 12px;
   line-height: 1;
+`;
+
+const Wrap = styled.aside`
+  background: var(--panel-2);
+  border-right: 1px solid var(--border);
+
+  display: flex;
+  flex-direction: column;
+
+  overflow: hidden;
+  box-sizing: border-box;
+
+  ${(p) =>
+    p.$mobile
+      ? `
+    position: fixed;
+    top: 0;
+    left: 0;
+    z-index: 50;
+
+    width: min(320px, 86vw);
+    height: 100dvh;
+
+    padding: 14px;
+    gap: 12px;
+
+    transform: translateX(${p.$open ? "0" : "-105%"});
+    opacity: ${p.$open ? "1" : "0"};
+    pointer-events: ${p.$open ? "auto" : "none"};
+    transition: transform 180ms ease, opacity 180ms ease;
+  `
+      : `
+    width: ${p.$collapsed ? "58px" : "250px"};
+    transition: width 180ms ease;
+
+    height: 100vh;
+    height: 100dvh;
+    max-height: 100vh;
+    max-height: 100dvh;
+
+    padding: 14px;
+    gap: 12px;
+  `}
+`;
+
+const CloseButton = styled.button`
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  cursor: pointer;
+
+  &:hover {
+    background: var(--hover);
+  }
 `;

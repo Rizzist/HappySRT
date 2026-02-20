@@ -1,8 +1,9 @@
 // components/UpgradePlansModal.js
 import { useEffect, useMemo, useState } from "react";
 import styled, { keyframes } from "styled-components";
+import { createPortal } from "react-dom";
 import { toast } from "sonner";
-import { useAuth } from "../contexts/AuthContext"; // adjust path if needed
+import { useAuth } from "../contexts/AuthContext";
 
 import PlansImport from "../shared/plans";
 const Plans = (PlansImport && (PlansImport.default || PlansImport)) || {};
@@ -44,55 +45,45 @@ function getPlanIcon(planKey) {
   return Star;
 }
 
+
+
+
+
+
+
+
+
 export default function UpgradePlansModal({ open, onClose, onSelectPlan, busyPlanKey, onLogout }) {
   const { billing, syncBilling, getJwt } = useAuth();
-
   const [portalBusy, setPortalBusy] = useState(false);
 
   useEffect(() => {
     if (!open) return;
-    // keep plan info fresh when modal opens (your syncBilling is already throttled)
     syncBilling?.({}).catch(() => {});
   }, [open, syncBilling]);
 
-  const handleOpenPortal = async () => {
-    if (portalBusy) return;
+  // ✅ Lock page scroll while modal is open
+  useEffect(() => {
+    if (!open) return;
+    if (typeof document === "undefined") return;
 
-    setPortalBusy(true);
-    try {
-      const jwt = await getJwt({ force: true });
-      if (!jwt) throw new Error("Not authenticated");
+    const body = document.body;
+    const prevOverflow = body.style.overflow;
+    const prevPaddingRight = body.style.paddingRight;
 
-      const res = await fetch("/api/billing/portal", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${jwt}`,
-        },
-        credentials: "include",
-        body: JSON.stringify({
-          returnPath: "/",
-        }),
-      });
+    const scrollbarWidth =
+      typeof window !== "undefined"
+        ? Math.max(0, (window.innerWidth || 0) - (document.documentElement?.clientWidth || 0))
+        : 0;
 
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data?.message || "Failed to open billing portal");
-      if (!data?.url) throw new Error("Portal URL missing from server response");
+    body.style.overflow = "hidden";
+    if (scrollbarWidth) body.style.paddingRight = `${scrollbarWidth}px`;
 
-      window.location.assign(String(data.url));
-    } catch (e) {
-      toast(e?.message || "Could not open billing portal");
-    } finally {
-      setPortalBusy(false);
-    }
-  };
-
-  const visiblePlans = useMemo(() => {
-    const list = Array.isArray(PLANS) ? PLANS : [];
-    const byKey = {};
-    for (const p of list) byKey[p?.key] = p;
-    return VISIBLE_KEYS.map((k) => byKey[k]).filter(Boolean);
-  }, []);
+    return () => {
+      body.style.overflow = prevOverflow;
+      body.style.paddingRight = prevPaddingRight;
+    };
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -103,9 +94,48 @@ export default function UpgradePlansModal({ open, onClose, onSelectPlan, busyPla
     return () => window.removeEventListener("keydown", onKey);
   }, [open, onClose]);
 
+  const visiblePlans = useMemo(() => {
+    const list = Array.isArray(PLANS) ? PLANS : [];
+    const byKey = {};
+    for (const p of list) byKey[p?.key] = p;
+    return VISIBLE_KEYS.map((k) => byKey[k]).filter(Boolean);
+  }, []);
+
+
+  const handleOpenPortal = async () => {
+  if (portalBusy) return;
+
+  setPortalBusy(true);
+  try {
+    const jwt = await getJwt({ force: true });
+    if (!jwt) throw new Error("Not authenticated");
+
+    const res = await fetch("/api/billing/portal", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${jwt}`,
+      },
+      credentials: "include",
+      body: JSON.stringify({ returnPath: "/" }),
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.message || "Failed to open billing portal");
+    if (!data?.url) throw new Error("Portal URL missing from server response");
+
+    window.location.assign(String(data.url));
+  } catch (e) {
+    toast(e?.message || "Could not open billing portal");
+  } finally {
+    setPortalBusy(false);
+  }
+};
+
+
   if (!open) return null;
 
-  return (
+  const ui = (
     <Overlay
       role="dialog"
       aria-modal="true"
@@ -143,7 +173,6 @@ export default function UpgradePlansModal({ open, onClose, onSelectPlan, busyPla
 
               const PlanIcon = getPlanIcon(p.key);
 
-              // Decide CTA behavior (NO "change in portal")
               const ctaDisabled = busy || portalBusy || !canCheckout || isCurrentPlan;
 
               let ctaLabel = "Continue";
@@ -193,66 +222,15 @@ export default function UpgradePlansModal({ open, onClose, onSelectPlan, busyPla
                     <HeroLabel>media tokens / month</HeroLabel>
                   </Hero>
 
-                  <Features>
-                    {/* Threads */}
-                    <FeatureRow>
-                      <FeatureIcon as={Users} aria-hidden="true" />
-                      <FeatureLabel>Threads</FeatureLabel>
-                      <FeatureValue>{fmtInt(e.threadLimit)}</FeatureValue>
-                    </FeatureRow>
-
-                    {/* Media upload / storage */}
-                    <FeatureRow>
-                      <FeatureIcon as={FileText} aria-hidden="true" />
-                      <FeatureLabel>Max file</FeatureLabel>
-                      <FeatureValue>{safeBytes(e.maxFileBytes)}</FeatureValue>
-                    </FeatureRow>
-
-                    <FeatureRow>
-                      <FeatureIcon as={UploadCloud} aria-hidden="true" />
-                      <FeatureLabel>Monthly upload</FeatureLabel>
-                      <FeatureValue>{safeBytes(e.monthlyUploadBytesCap)}</FeatureValue>
-                    </FeatureRow>
-
-                    <FeatureRow>
-                      <FeatureIcon as={Database} aria-hidden="true" />
-                      <FeatureLabel>Active storage</FeatureLabel>
-                      <FeatureValue>{safeBytes(e.activeStorageBytesCap)}</FeatureValue>
-                    </FeatureRow>
-
-                    <FeatureRow>
-                      <FeatureIcon as={Clock} aria-hidden="true" />
-                      <FeatureLabel>Retention</FeatureLabel>
-                      <FeatureValue>{fmtInt(e.retentionDays)} days</FeatureValue>
-                    </FeatureRow>
-
-                    {/* Saving limits */}
-                    <Divider />
-
-                    <FeatureRow>
-                      <FeatureIcon as={Star} aria-hidden="true" />
-                      <FeatureLabel>Saved items</FeatureLabel>
-                      <FeatureValue>{fmtInt(e.savedItemCountCap)}</FeatureValue>
-                    </FeatureRow>
-
-                    <FeatureRow>
-                      <FeatureIcon as={FileText} aria-hidden="true" />
-                      <FeatureLabel>Max saved item</FeatureLabel>
-                      <FeatureValue>{safeBytes(e.maxSavedItemBytes)}</FeatureValue>
-                    </FeatureRow>
-
-                    <FeatureRow>
-                      <FeatureIcon as={UploadCloud} aria-hidden="true" />
-                      <FeatureLabel>Monthly saves</FeatureLabel>
-                      <FeatureValue>{safeBytes(e.monthlySaveBytesCap)}</FeatureValue>
-                    </FeatureRow>
-
-                    <FeatureRow>
-                      <FeatureIcon as={Database} aria-hidden="true" />
-                      <FeatureLabel>Saved storage</FeatureLabel>
-                      <FeatureValue>{safeBytes(e.savedStorageBytesCap)}</FeatureValue>
-                    </FeatureRow>
-                  </Features>
+<Features> {/* Threads */} <FeatureRow> <FeatureIcon as={Users} aria-hidden="true" /> 
+<FeatureLabel>Threads</FeatureLabel> 
+<FeatureValue>{fmtInt(e.threadLimit)}</FeatureValue> 
+</FeatureRow> {/* Media upload / storage */} <FeatureRow> 
+    <FeatureIcon as={FileText} aria-hidden="true" /> 
+    <FeatureLabel>Max file</FeatureLabel> 
+    <FeatureValue>{safeBytes(e.maxFileBytes)}</FeatureValue> </FeatureRow> 
+    <FeatureRow> <FeatureIcon as={UploadCloud} aria-hidden="true" /> <FeatureLabel>Monthly upload</FeatureLabel> <FeatureValue>{safeBytes(e.monthlyUploadBytesCap)}</FeatureValue> </FeatureRow> 
+    <FeatureRow> <FeatureIcon as={Database} aria-hidden="true" /> <FeatureLabel>Active storage</FeatureLabel> <FeatureValue>{safeBytes(e.activeStorageBytesCap)}</FeatureValue> </FeatureRow> <FeatureRow> <FeatureIcon as={Clock} aria-hidden="true" /> <FeatureLabel>Retention</FeatureLabel> <FeatureValue>{fmtInt(e.retentionDays)} days</FeatureValue> </FeatureRow> {/* Saving limits */} <Divider /> <FeatureRow> <FeatureIcon as={Star} aria-hidden="true" /> <FeatureLabel>Saved items</FeatureLabel> <FeatureValue>{fmtInt(e.savedItemCountCap)}</FeatureValue> </FeatureRow> <FeatureRow> <FeatureIcon as={FileText} aria-hidden="true" /> <FeatureLabel>Max saved item</FeatureLabel> <FeatureValue>{safeBytes(e.maxSavedItemBytes)}</FeatureValue> </FeatureRow> <FeatureRow> <FeatureIcon as={UploadCloud} aria-hidden="true" /> <FeatureLabel>Monthly saves</FeatureLabel> <FeatureValue>{safeBytes(e.monthlySaveBytesCap)}</FeatureValue> </FeatureRow> <FeatureRow> <FeatureIcon as={Database} aria-hidden="true" /> <FeatureLabel>Saved storage</FeatureLabel> <FeatureValue>{safeBytes(e.savedStorageBytesCap)}</FeatureValue> </FeatureRow> </Features>
 
                   <CardBottom>
                     <CTA
@@ -267,7 +245,6 @@ export default function UpgradePlansModal({ open, onClose, onSelectPlan, busyPla
                           return;
                         }
 
-                        // always go to checkout (even if hasSubscription)
                         onSelectPlan?.(p.key);
                       }}
                     >
@@ -298,8 +275,13 @@ export default function UpgradePlansModal({ open, onClose, onSelectPlan, busyPla
       </Modal>
     </Overlay>
   );
+
+  // ✅ Portal to body so it never gets clipped by Sidebar transform/overflow
+  if (typeof document === "undefined") return ui;
+  return createPortal(ui, document.body);
 }
 
+/* --- styles --- */
 const fadeIn = keyframes`
   from { opacity: 0; }
   to { opacity: 1; }
@@ -314,6 +296,7 @@ const cardIn = keyframes`
   from { transform: translateY(10px); opacity: 0; }
   to { transform: translateY(0); opacity: 1; }
 `;
+
 
 const Overlay = styled.div`
   position: fixed;
@@ -333,9 +316,7 @@ const Overlay = styled.div`
     background: rgba(0, 0, 0, 0.22);
   }
 
-  @media (prefers-reduced-motion: reduce) {
-    animation: none;
-  }
+
 `;
 
 const Modal = styled.div`
@@ -351,9 +332,10 @@ const Modal = styled.div`
 
   animation: ${popIn} 180ms cubic-bezier(0.2, 0.9, 0.2, 1) both;
 
-  @media (prefers-reduced-motion: reduce) {
-    animation: none;
-  }
+  display: flex;
+  flex-direction: column;
+
+
 `;
 
 const Header = styled.div`
@@ -366,7 +348,38 @@ const Header = styled.div`
   gap: 12px;
 
   background: linear-gradient(180deg, rgba(0, 0, 0, 0.03), transparent);
+
+  /* ✅ Safe area top on mobile */
+  @media (max-width: 560px), (max-height: 680px) {
+    padding-top: calc(14px + env(safe-area-inset-top));
+  }
 `;
+
+const Body = styled.div`
+  padding: 14px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+
+  /* ✅ Safe area bottom so footer content isn’t under home indicator */
+  padding-bottom: calc(14px + env(safe-area-inset-bottom));
+
+  @media(max-width: 786px){
+    padding: 10px 16px;
+  }
+
+  @media (max-width: 560px), (max-height: 680px) {
+    padding-bottom: calc(16px + env(safe-area-inset-bottom));
+  }
+
+`;
+
+
+
+
+
+
+
 
 const HeaderLeft = styled.div`
   display: flex;
@@ -432,10 +445,6 @@ const CloseIcon = styled(X)`
   opacity: 0.9;
 `;
 
-const Body = styled.div`
-  padding: 14px;
-  overflow: auto;
-`;
 
 const Cards = styled.div`
   display: grid;
@@ -501,12 +510,21 @@ const PlanMark = styled.div`
   display: grid;
   place-items: center;
   flex: 0 0 auto;
+
+  @media(max-width: 786px) {
+    width: 32px;
+    height: 32px;
+  }
 `;
 
 const PlanIconStyled = styled.span`
   width: 18px;
   height: 18px;
   opacity: 0.85;
+  @media(max-width: 786px) {
+    width: 16px;
+    height: 16px;
+  }
 `;
 
 const PlanText = styled.div`
@@ -514,6 +532,9 @@ const PlanText = styled.div`
   display: flex;
   flex-direction: column;
   gap: 4px;
+  @media(max-width: 786px) {
+    gap: 0px;
+  }
 `;
 
 const PlanNameRow = styled.div`
@@ -592,6 +613,9 @@ const HeroNumber = styled.div`
   font-weight: 1000;
   color: var(--text);
   line-height: 1.05;
+    @media(max-width: 786px) {
+    font-size: 20px;
+  }
 `;
 
 const HeroLabel = styled.div`
@@ -599,6 +623,9 @@ const HeroLabel = styled.div`
   font-size: 11px;
   color: var(--muted);
   font-weight: 850;
+  @media(max-width: 786px) {
+    font-size: 10px;
+  }
 `;
 
 const Features = styled.div`
@@ -625,18 +652,29 @@ const FeatureRow = styled.div`
   grid-template-columns: 18px 1fr auto;
   align-items: center;
   gap: 10px;
+    @media(max-width: 786px) {
+    padding: 5px 5px;
+    gap: 8px;
+  }
 `;
 
 const FeatureIcon = styled.span`
   width: 16px;
   height: 16px;
   opacity: 0.75;
+    @media(max-width: 786px) {
+    width: 15px;
+    height: 15px;
+  }
 `;
 
 const FeatureLabel = styled.div`
   font-size: 12px;
   font-weight: 850;
   color: var(--muted);
+  @media(max-width: 786px) {
+    font-size: 11px;
+  }
 `;
 
 const FeatureValue = styled.div`
@@ -644,6 +682,9 @@ const FeatureValue = styled.div`
   font-weight: 950;
   color: var(--text);
   text-align: right;
+    @media(max-width: 786px) {
+    font-size: 11px;
+  }
 `;
 
 const CardBottom = styled.div`
