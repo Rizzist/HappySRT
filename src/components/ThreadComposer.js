@@ -74,8 +74,9 @@ function isReadyDraftFile(f) {
 
 function isBusyDraftFile(f) {
   const stage = String(f?.stage || "");
-  return stage === "uploading" || stage === "converting" || stage === "linking";
+  return stage === "uploading" || stage === "converting" || stage === "linking" || stage === "downloading";
 }
+
 
 function safeArr(x) {
   return Array.isArray(x) ? x : [];
@@ -1221,16 +1222,19 @@ useEffect(() => {
               // avoid showing boring "uploading" twice
               const uploadStage = uploadStageRaw && uploadStageRaw !== "uploading" ? uploadStageRaw : "";
 
-              const stageLabel =
-                f.stage === "uploaded"
-                  ? "Uploaded (mp3)"
-                  : f.stage === "converting"
-                  ? "Converting to mp3…"
-                  : f.stage === "uploading"
-                  ? "Uploading mp3…"
-                  : f.stage === "linked"
-                  ? "Linked"
-                  : f.stage || "Draft";
+const stageLabel =
+  f.stage === "uploaded"
+    ? "Uploaded (mp3)"
+    : f.stage === "downloading"
+    ? "Downloading…"
+    : f.stage === "converting"
+    ? "Converting to mp3…"
+    : f.stage === "uploading"
+    ? "Uploading mp3…"
+    : f.stage === "linked"
+    ? "Linked"
+    : f.stage || "Draft";
+
 
               // ✅ live extra for uploads (optional)
               const stageExtra =

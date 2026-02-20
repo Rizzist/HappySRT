@@ -12,7 +12,7 @@ import { putLocalMediaMeta } from "../lib/mediaMetaStore";
 import { safeLangKey, deleteLangKey } from "../lib/langKey";
 import { makeScope } from "../lib/scopeKey";
 import { uploadDraftFileViaWs, uploadDraftUrlViaWs } from "../lib/wsDraftUploadClient";
-
+import {downloadMediaFileFromUrl} from "../lib/downloadMediaFileFromURL"
 
 import * as BillingImport from "../shared/billingCatalog";
 import * as TranslationImport from "../shared/translationCatalog";
@@ -2707,117 +2707,203 @@ return toast.promise(
 );
   };
 
-  const addDraftMediaFromUrl = async (threadId, url) => {
-    if (!threadId || threadId === "default") return;
+const addDraftMediaFromUrl = async (threadId, url) => {
+  if (!threadId || threadId === "default") return;
 
-    const clean = String(url || "").trim();
-    if (!clean) return;
+  const clean = String(url || "").trim();
+  if (!clean) return;
 
-    const cur = threadsRef.current || {};
-    const t = cur[threadId];
-    if (!t) return;
+  const cur = threadsRef.current || {};
+  const t = cur[threadId];
+  if (!t) return;
 
-    const itemId = uuid();
-    const clientFileId = uuid();
+  const itemId = uuid();
+  const clientFileId = uuid();
 
-    const draft = ensureDraftShape(t.draft);
+  const draft = ensureDraftShape(t.draft);
 
-    const optimistic = {
-      itemId,
-      clientFileId,
-      sourceType: "url",
-      url: clean,
-      urlMeta: {},
-      stage: "linking",
-      createdAt: nowIso(),
-      updatedAt: nowIso(),
-    };
+  const optimistic = {
+    itemId,
+    clientFileId,
+    sourceType: "url",
+    url: clean,
+    urlMeta: {},
+    stage: "downloading",
+    downloadPct: 0,
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+  };
 
-    const nextDraft = ensureDraftShape({ ...draft, files: [optimistic, ...(draft.files || [])] });
-    const nextThread = {
-      ...t,
-      draft: nextDraft,
-      draftRev: (t.draftRev || 0) + 1,
-      draftUpdatedAt: nowIso(),
-      updatedAt: nowIso(),
-    };
+  const nextDraft = ensureDraftShape({ ...draft, files: [optimistic, ...(draft.files || [])] });
+  const nextThread = {
+    ...t,
+    draft: nextDraft,
+    draftRev: (t.draftRev || 0) + 1,
+    draftUpdatedAt: nowIso(),
+    updatedAt: nowIso(),
+  };
 
-    await commit({ ...cur, [threadId]: nextThread }, activeRef.current, syncRef.current);
+  await commit({ ...cur, [threadId]: nextThread }, activeRef.current, syncRef.current);
 
-    return toast.promise(
-      (async () => {
-        const jwt = await getJwtIfAny();
+  return toast.promise(
+    (async () => {
+      // 1) Download -> File
+      const { file: originalFile } = await downloadMediaFileFromUrl(clean, {
+        onProgress: (ev) => {
+          patchDraftFileUi(threadId, itemId, {
+            stage: "downloading",
+            downloadPct: ev?.pct ?? null,
+            downloadReceivedBytes: ev?.receivedBytes ?? null,
+            downloadTotalBytes: ev?.totalBytes ?? null,
+          });
+        },
+      });
 
-        let dur = null;
-        try {
-          dur = await probeDurationSecondsFromUrl(clean);
-        } catch {}
+      const originalMime = String(originalFile?.type || "");
+      const originalIsVideo = originalMime.startsWith("video/");
 
-        const urlMeta = dur != null ? { durationSeconds: dur } : {};
+      const localMeta = {
+        name: originalFile?.name || "media",
+        size: originalFile?.size || 0,
+        mime: originalMime,
+        lastModified: originalFile?.lastModified || 0,
+        isVideo: originalIsVideo,
+      };
 
-        const fd = new FormData();
-        fd.append("threadId", threadId);
-        fd.append("itemId", itemId);
-        fd.append("clientFileId", clientFileId);
-        fd.append("sourceType", "url");
-        fd.append("url", clean);
-        fd.append("title", t.title || "New Thread");
-        fd.append("urlMeta", JSON.stringify(urlMeta));
+      // 2) Store original locally (so preview works like device uploads)
+      if (scope) {
+        await putLocalMedia(scope, threadId, clientFileId, originalFile);
 
-        const r = await postForm("/api/threads/draft/upload", jwt, fd);
+        await putLocalMediaMeta(scope, threadId, clientFileId, {
+          origin: "url",
+          url: clean,
+          name: localMeta.name,
+          mime: localMeta.mime,
+          isVideo: localMeta.isVideo,
+          bytes: localMeta.size,
+          savedAt: nowIso(),
+        });
+      }
 
-        const cur2 = threadsRef.current || {};
-        const t2 = cur2[threadId];
-        if (!t2) return itemId;
+      // 3) Move to converting/uploading (same UX as normal upload)
+      patchDraftFileUi(threadId, itemId, {
+        local: localMeta,
+        stage: isMp3(originalFile) ? "uploading" : "converting",
+        downloadPct: null,
+        downloadReceivedBytes: null,
+        downloadTotalBytes: null,
+        uploadPct: isMp3(originalFile) ? 0 : null,
+        uploadStage: isMp3(originalFile) ? "verifying" : null,
+      });
 
-        const d2 = ensureDraftShape(t2.draft);
-        const files2 = [...(d2.files || [])];
-        const idx = files2.findIndex((x) => String(x?.itemId) === String(itemId));
-        if (idx >= 0) {
-          files2[idx] = {
-            ...files2[idx],
-            ...(r.draftFile || {}),
-            stage: r?.draftFile?.stage || "linked",
-            updatedAt: nowIso(),
-          };
-        }
+      // 4) Convert -> mp3 (if needed), then WS upload mp3 (but keep original locally!)
+      let mp3File = originalFile;
 
-        const nextT2 = {
-          ...t2,
-          draft: { ...d2, files: files2 },
-          draftRev: typeof r.draftRev === "number" ? r.draftRev : (t2.draftRev || 0) + 1,
-          draftUpdatedAt: r.draftUpdatedAt || nowIso(),
+      if (!isMp3(originalFile)) {
+        mp3File = await convertToMp3OrPassThrough(originalFile, { ensureFfmpeg, extractAudioToMp3 });
+
+        patchDraftFileUi(threadId, itemId, {
+          stage: "uploading",
+          uploadPct: 0,
+          uploadStage: "verifying",
+        });
+      }
+
+      try {
+        const dur = await probeDurationSecondsFromFile(mp3File);
+        if (dur != null) localMeta.durationSeconds = dur;
+      } catch {}
+
+      await connectWsForThread(threadId);
+
+      const r = await uploadDraftFileViaWs({
+        wsClient: wsClientRef.current,
+        threadId,
+        itemId,
+        clientFileId,
+        file: mp3File,
+        localMeta,
+        onProgress: (ev) => {
+          try {
+            forwardUploadProgressToDraft(threadId, itemId, ev);
+          } catch {}
+        },
+      });
+
+      // 5) Merge server draftFile, end at "uploaded"
+      const cur2 = threadsRef.current || {};
+      const t2 = cur2[threadId];
+      if (!t2) return itemId;
+
+      const d2 = ensureDraftShape(t2.draft);
+      const files2 = [...(d2.files || [])];
+      const idx2 = files2.findIndex((x) => String(x?.itemId) === String(itemId));
+      if (idx2 >= 0) {
+        const prev = files2[idx2] || {};
+        const srv = r && r.draftFile ? r.draftFile : {};
+
+        files2[idx2] = {
+          ...prev,
+          ...srv,
+          // keep client bits
+          clientFileId: prev.clientFileId,
+          url: prev.url,
+          sourceType: prev.sourceType,
+          local: prev.local,
+          audio: { ...(prev.audio || {}), ...(srv.audio || {}) },
+          stage: "uploaded",
+          uploadPct: null,
+          uploadStage: null,
+          uploadSentBytes: null,
+          uploadReceivedBytes: null,
           updatedAt: nowIso(),
         };
-
-        await commit({ ...cur2, [threadId]: nextT2 }, activeRef.current, syncRef.current);
-        return itemId;
-      })(),
-      {
-        loading: "Saving link…",
-        success: "Linked",
-        error: async (e) => {
-          try {
-            const cur2 = threadsRef.current || {};
-            const t2 = cur2[threadId];
-            if (t2) {
-              const d2 = ensureDraftShape(t2.draft);
-              const files2 = (d2.files || []).filter((x) => String(x?.itemId) !== String(itemId));
-              const nextT2 = {
-                ...t2,
-                draft: { ...d2, files: files2 },
-                draftRev: (t2.draftRev || 0) + 1,
-                draftUpdatedAt: nowIso(),
-                updatedAt: nowIso(),
-              };
-              await commit({ ...cur2, [threadId]: nextT2 }, activeRef.current, syncRef.current);
-            }
-          } catch {}
-          return e?.message || "Failed to add link";
-        },
       }
-    );
-  };
+
+      const nextT2 = {
+        ...t2,
+        draft: { ...d2, files: files2 },
+        draftRev: typeof r.draftRev === "number" ? r.draftRev : (t2.draftRev || 0) + 1,
+        draftUpdatedAt: r.draftUpdatedAt || nowIso(),
+        updatedAt: nowIso(),
+      };
+
+      await commit({ ...cur2, [threadId]: nextT2 }, activeRef.current, syncRef.current);
+
+      return itemId;
+    })(),
+    {
+      loading: "Downloading…",
+      success: "Added",
+      error: async (e) => {
+        // cleanup local + draft entry
+        try {
+          if (scope) await deleteLocalMedia(scope, threadId, clientFileId);
+        } catch {}
+
+        try {
+          const cur2 = threadsRef.current || {};
+          const t2 = cur2[threadId];
+          if (t2) {
+            const d2 = ensureDraftShape(t2.draft);
+            const files2 = (d2.files || []).filter((x) => String(x?.itemId) !== String(itemId));
+            const nextT2 = {
+              ...t2,
+              draft: { ...d2, files: files2 },
+              draftRev: (t2.draftRev || 0) + 1,
+              draftUpdatedAt: nowIso(),
+              updatedAt: nowIso(),
+            };
+            await commit({ ...cur2, [threadId]: nextT2 }, activeRef.current, syncRef.current);
+          }
+        } catch {}
+
+        return e?.message || "Failed to add URL media";
+      },
+    }
+  );
+};
+
 
   const deleteDraftMedia = async (threadId, itemId) => {
     if (!threadId || threadId === "default" || !itemId) return;
