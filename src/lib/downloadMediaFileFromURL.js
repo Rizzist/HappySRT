@@ -52,10 +52,18 @@ function filenameFromContentDisposition(cd) {
   return null;
 }
 
+function makeAbortError(message) {
+  const e = new Error(message || "Aborted");
+  e.name = "AbortError";
+  return e;
+}
+
 // Fetch with streaming progress. If CORS blocks the direct URL, fallback to same-origin proxy.
 export async function downloadMediaFileFromUrl(url, { onProgress, signal } = {}) {
   const clean = String(url || "").trim();
   if (!clean) throw new Error("Missing URL");
+
+  if (signal?.aborted) throw makeAbortError("Aborted");
 
   const tryFetch = async (u) => {
     return fetch(u, {
@@ -71,13 +79,20 @@ export async function downloadMediaFileFromUrl(url, { onProgress, signal } = {})
   try {
     res = await tryFetch(clean);
   } catch (e) {
+    if (signal?.aborted) throw makeAbortError("Aborted");
     res = null;
   }
 
   // If CORS blocked, do a same-origin proxy (you’ll add this endpoint in step 2)
   if (!res || !res.ok) {
-    const proxied = `/api/threads/draft//proxy?url=${encodeURIComponent(clean)}`;
-    res = await tryFetch(proxied);
+    if (signal?.aborted) throw makeAbortError("Aborted");
+    const proxied = `/api/threads/draft/proxy?url=${encodeURIComponent(clean)}`;
+    try {
+      res = await tryFetch(proxied);
+    } catch (e) {
+      if (signal?.aborted) throw makeAbortError("Aborted");
+      res = null;
+    }
   }
 
   if (!res || !res.ok) {
@@ -102,28 +117,54 @@ export async function downloadMediaFileFromUrl(url, { onProgress, signal } = {})
     const chunks = [];
     let received = 0;
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      received += value.byteLength || value.length || 0;
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          try {
+            await reader.cancel();
+          } catch {}
+          throw makeAbortError("Aborted");
+        }
 
-      if (typeof onProgress === "function") {
-        const pct = totalBytes ? Math.round((received / totalBytes) * 100) : null;
-        onProgress({
-          stage: "downloading",
-          pct,
-          receivedBytes: received,
-          totalBytes,
-        });
+        let out;
+        try {
+          out = await reader.read();
+        } catch (err) {
+          if (signal?.aborted) throw makeAbortError("Aborted");
+          throw err;
+        }
+
+        const { done, value } = out;
+        if (done) break;
+
+        chunks.push(value);
+        received += value.byteLength || value.length || 0;
+
+        if (typeof onProgress === "function") {
+          const pct = totalBytes ? Math.round((received / totalBytes) * 100) : null;
+          onProgress({
+            stage: "downloading",
+            pct,
+            receivedBytes: received,
+            totalBytes,
+          });
+        }
       }
+    } finally {
+      // reader will close naturally; cancel handled above on abort
     }
 
     buf = new Blob(chunks, { type: guessed });
   } else {
     // Fallback (no progress)
-    const ab = await res.arrayBuffer();
+    if (signal?.aborted) throw makeAbortError("Aborted");
+    const ab = await res.arrayBuffer().catch((e) => {
+      if (signal?.aborted) throw makeAbortError("Aborted");
+      throw e;
+    });
+
     buf = new Blob([ab], { type: guessed });
+
     if (typeof onProgress === "function") {
       onProgress({ stage: "downloading", pct: 100, receivedBytes: buf.size, totalBytes: buf.size });
     }

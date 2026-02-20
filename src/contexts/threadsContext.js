@@ -219,8 +219,9 @@ function ensureServerShape(s) {
 
 function isBusyDraftFile(f) {
   const stage = String(f?.stage || "");
-  return stage === "uploading" || stage === "converting" || stage === "linking";
+  return stage === "uploading" || stage === "converting" || stage === "linking" || stage === "downloading";
 }
+
 
 function mergeDraft(serverDraft, localDraft) {
   const s = ensureDraftShape(serverDraft);
@@ -1028,6 +1029,56 @@ export function ThreadsProvider({ children }) {
   const creatingThreadRef = useRef(false);
 const [creatingThread, setCreatingThread] = useState(false);
 
+// ✅ Fix #2: abort in-flight URL downloads
+const urlDownloadAbortRef = useRef({}); // key -> AbortController
+
+const dlKey = (threadId, itemId) => `${String(threadId || "")}:${String(itemId || "")}`;
+
+const abortUrlDownload = (threadId, itemId, reason) => {
+  const k = dlKey(threadId, itemId);
+  const ctrl = urlDownloadAbortRef.current?.[k];
+  if (!ctrl) return;
+
+  try {
+    ctrl.abort(reason || "aborted");
+  } catch {}
+  try {
+    const next = { ...(urlDownloadAbortRef.current || {}) };
+    delete next[k];
+    urlDownloadAbortRef.current = next;
+  } catch {}
+};
+
+const abortUrlDownloadsForThread = (threadId, reason) => {
+  const tid = String(threadId || "");
+  if (!tid) return;
+
+  const keys = Object.keys(urlDownloadAbortRef.current || {});
+  for (const k of keys) {
+    if (!k.startsWith(`${tid}:`)) continue;
+    const ctrl = urlDownloadAbortRef.current[k];
+    try {
+      ctrl && ctrl.abort(reason || "thread_aborted");
+    } catch {}
+  }
+
+  // cleanup map
+  const next = { ...(urlDownloadAbortRef.current || {}) };
+  for (const k of keys) if (k.startsWith(`${tid}:`)) delete next[k];
+  urlDownloadAbortRef.current = next;
+};
+
+const abortAllUrlDownloads = (reason) => {
+  const keys = Object.keys(urlDownloadAbortRef.current || {});
+  for (const k of keys) {
+    try {
+      urlDownloadAbortRef.current[k]?.abort(reason || "all_aborted");
+    } catch {}
+  }
+  urlDownloadAbortRef.current = {};
+};
+
+
 // ✅ Add these helpers ONCE inside ThreadsProvider (near other refs/helpers)
 const draftUploadUiRef = useRef({}); // itemId -> { at, pct, stage }
 
@@ -1221,8 +1272,31 @@ const forwardUploadProgressToDraft = (threadId, itemId, ev) => {
     setWsError(null);
   };
 
+  // ✅ Fix #2: abort URL downloads when switching threads (recommended)
+useEffect(() => {
+  const keepTid = String(activeId || "");
+  const keys = Object.keys(urlDownloadAbortRef.current || {});
+
+  for (const k of keys) {
+    const tid = k.split(":")[0]; // safe: your UUIDs don't contain ':'
+    if (!keepTid || keepTid === "default" || tid !== keepTid) {
+      try {
+        urlDownloadAbortRef.current[k]?.abort("thread_switch");
+      } catch {}
+      try {
+        const next = { ...(urlDownloadAbortRef.current || {}) };
+        delete next[k];
+        urlDownloadAbortRef.current = next;
+      } catch {}
+    }
+  }
+}, [activeId]);
+
+
   useEffect(() => {
   if (!scope) return;
+
+  abortAllUrlDownloads("scope_change");
 
   // kill any previous WS connection immediately
   disconnectWs();
@@ -2478,7 +2552,7 @@ return;
 
   const deleteThread = async (threadId) => {
     if (!threadId || threadId === "default") return;
-
+    abortUrlDownloadsForThread(threadId, "thread_deleted");
     const cur = threadsRef.current || {};
     const t = cur[threadId];
     if (!t) return;
@@ -2745,10 +2819,19 @@ const addDraftMediaFromUrl = async (threadId, url) => {
 
   await commit({ ...cur, [threadId]: nextThread }, activeRef.current, syncRef.current);
 
-  return toast.promise(
-    (async () => {
-      // 1) Download -> File
+ // ✅ Fix #2: create an AbortController for this URL download
+const controller = new AbortController();
+urlDownloadAbortRef.current = {
+  ...(urlDownloadAbortRef.current || {}),
+  [dlKey(threadId, itemId)]: controller,
+};
+
+return toast.promise(
+  (async () => {
+    try {
+      // 1) Download -> File (ABORTABLE)
       const { file: originalFile } = await downloadMediaFileFromUrl(clean, {
+        signal: controller.signal,
         onProgress: (ev) => {
           patchDraftFileUi(threadId, itemId, {
             stage: "downloading",
@@ -2758,6 +2841,23 @@ const addDraftMediaFromUrl = async (threadId, url) => {
           });
         },
       });
+
+      // (optional but recommended) if item got deleted mid-flight (race), stop right here
+      const stillExists = (() => {
+        const tNow = (threadsRef.current || {})[threadId];
+        const dNow = ensureDraftShape(tNow?.draft);
+        const filesNow = Array.isArray(dNow.files) ? dNow.files : [];
+        return filesNow.some((x) => String(x?.itemId || "") === String(itemId));
+      })();
+
+      if (!stillExists) {
+        try {
+          controller.abort("item_missing");
+        } catch {}
+        const e = new Error("Cancelled");
+        e.name = "AbortError";
+        throw e;
+      }
 
       const originalMime = String(originalFile?.type || "");
       const originalIsVideo = originalMime.startsWith("video/");
@@ -2871,43 +2971,57 @@ const addDraftMediaFromUrl = async (threadId, url) => {
       await commit({ ...cur2, [threadId]: nextT2 }, activeRef.current, syncRef.current);
 
       return itemId;
-    })(),
-    {
-      loading: "Downloading…",
-      success: "Added",
-      error: async (e) => {
-        // cleanup local + draft entry
-        try {
-          if (scope) await deleteLocalMedia(scope, threadId, clientFileId);
-        } catch {}
-
-        try {
-          const cur2 = threadsRef.current || {};
-          const t2 = cur2[threadId];
-          if (t2) {
-            const d2 = ensureDraftShape(t2.draft);
-            const files2 = (d2.files || []).filter((x) => String(x?.itemId) !== String(itemId));
-            const nextT2 = {
-              ...t2,
-              draft: { ...d2, files: files2 },
-              draftRev: (t2.draftRev || 0) + 1,
-              draftUpdatedAt: nowIso(),
-              updatedAt: nowIso(),
-            };
-            await commit({ ...cur2, [threadId]: nextT2 }, activeRef.current, syncRef.current);
-          }
-        } catch {}
-
-        return e?.message || "Failed to add URL media";
-      },
+    } finally {
+      // ✅ Fix #2: cleanup controller map entry no matter what
+      const k = dlKey(threadId, itemId);
+      const next = { ...(urlDownloadAbortRef.current || {}) };
+      delete next[k];
+      urlDownloadAbortRef.current = next;
     }
-  );
+  })(),
+  {
+    loading: "Downloading…",
+    success: "Added",
+    error: async (e) => {
+      const isAbort =
+        e?.name === "AbortError" ||
+        String(e?.code || "").toUpperCase() === "ABORTED" ||
+        /aborted|cancelled/i.test(String(e?.message || ""));
+
+      // cleanup local + draft entry
+      try {
+        if (scope) await deleteLocalMedia(scope, threadId, clientFileId);
+      } catch {}
+
+      try {
+        const cur2 = threadsRef.current || {};
+        const t2 = cur2[threadId];
+        if (t2) {
+          const d2 = ensureDraftShape(t2.draft);
+          const files2 = (d2.files || []).filter((x) => String(x?.itemId) !== String(itemId));
+          const nextT2 = {
+            ...t2,
+            draft: { ...d2, files: files2 },
+            draftRev: (t2.draftRev || 0) + 1,
+            draftUpdatedAt: nowIso(),
+            updatedAt: nowIso(),
+          };
+          await commit({ ...cur2, [threadId]: nextT2 }, activeRef.current, syncRef.current);
+        }
+      } catch {}
+
+      if (isAbort) return "Cancelled";
+      return e?.message || "Failed to add URL media";
+    },
+  }
+);
+
 };
 
 
   const deleteDraftMedia = async (threadId, itemId) => {
     if (!threadId || threadId === "default" || !itemId) return;
-
+    abortUrlDownload(threadId, itemId, "item_deleted");
     const cur = threadsRef.current || {};
     const t = cur[threadId];
     if (!t) return;
