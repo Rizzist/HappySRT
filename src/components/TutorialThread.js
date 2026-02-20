@@ -1,7 +1,28 @@
 // components/TutorialThread.js
 import styled from "styled-components";
 
-const GITHUB_REPO_LINK = "https://github.com/Rizzist/happysrt"
+const SCREENSHOTS = [
+  {
+    src: "/icons/screenshots/boot.jpg",
+    title: "Welcome screen",
+    desc: "A clean workspace built for creators",
+  },
+  {
+    src: "/icons/screenshots/tut.jpg",
+    title: "Quick tour",
+    desc: "Threads + upload + run actions",
+  },
+  {
+    src: "/icons/screenshots/sample.jpg",
+    title: "Results",
+    desc: "Transcription • Translation • Summary tabs",
+  },
+  {
+    src: "/icons/screenshots/pay.jpg",
+    title: "Tokens",
+    desc: "Track usage + upgrade when needed",
+  },
+];
 
 export default function TutorialThread() {
   return (
@@ -9,7 +30,7 @@ export default function TutorialThread() {
       <Card>
         <TitleRow>
           <H2>Welcome to HappySRT</H2>
-          <Pill>Open source</Pill>
+          <Pill>Quick start</Pill>
         </TitleRow>
 
         <P>
@@ -21,19 +42,56 @@ export default function TutorialThread() {
           This <b>Default</b> thread is a permanent guide. Your real work happens in your own threads in the sidebar.
         </Hint>
 
-        <LinkRow>
-          <GitHubLink
-            href={GITHUB_REPO_LINK}
-            target="_blank"
-            rel="noreferrer"
-            title="View the source on GitHub"
-          >
-            View on GitHub →
-          </GitHubLink>
-          <Muted>
-            If you like the project, leaving a ⭐ helps a lot.
-          </Muted>
-        </LinkRow>
+        <MiniSteps>
+          <MiniStep>
+            <Dot>1</Dot>
+            <span>
+              Click <b>+ New thread</b>
+            </span>
+          </MiniStep>
+          <MiniStep>
+            <Dot>2</Dot>
+            <span>
+              <b>Upload</b> a file or paste a <b>media URL</b>
+            </span>
+          </MiniStep>
+          <MiniStep>
+            <Dot>3</Dot>
+            <span>
+              Run <b>Transcribe → Translate → Summarize</b>
+            </span>
+          </MiniStep>
+          <MiniStep>
+            <Dot>4</Dot>
+            <span>
+              <b>Download SRT</b> / <b>Copy</b> / <b>Save</b>
+            </span>
+          </MiniStep>
+        </MiniSteps>
+      </Card>
+
+      <Card>
+        <H3>See what it looks like 👀</H3>
+        <P>
+          Swipe through a quick preview. In practice, you’ll create a thread per project and your results stay organized
+          and searchable.
+        </P>
+
+        <Gallery aria-label="HappySRT screenshots">
+          {SCREENSHOTS.map((shot) => (
+            <Shot key={shot.src}>
+              <ShotImg src={shot.src} alt={`${shot.title} — ${shot.desc}`} loading="lazy" />
+              <ShotMeta>
+                <ShotTitle>{shot.title}</ShotTitle>
+                <ShotDesc>{shot.desc}</ShotDesc>
+              </ShotMeta>
+            </Shot>
+          ))}
+        </Gallery>
+
+        <Note>
+          Tip: If you’re on desktop, you can also scroll the gallery horizontally with <b>Shift + mouse wheel</b>.
+        </Note>
       </Card>
 
       <Card>
@@ -59,18 +117,18 @@ export default function TutorialThread() {
         <H3>Core features</H3>
         <List>
           <li>
-            <b>Transcription</b> → turns speech into text with timestamps (SRT-ready).
+            🎙️ <b>Transcription</b> → turns speech into text with timestamps (SRT-ready).
           </li>
           <li>
-            <b>Translation</b> → generates subtitle tracks in your target language.
+            🌍 <b>Translation</b> → generates subtitle tracks in your target language.
           </li>
           <li>
-            <b>Summarization</b> → produces highlights, bullets, and quick notes from the content.
+            🧠 <b>Summarization</b> → produces highlights, bullets, and quick notes from the content.
           </li>
         </List>
 
         <Hint>
-          You can run a single action (e.g. just Transcription) or combine them (e.g. Transcribe → Translate → Summarize).
+          You can run a single action (e.g. just Transcription) or chain them (e.g. Transcribe → Translate → Summarize).
         </Hint>
       </Card>
 
@@ -78,14 +136,14 @@ export default function TutorialThread() {
         <H3>Uploads, exports, and results</H3>
         <List>
           <li>
-            <b>Upload</b> a file (audio/video). Larger files use more processing.
+            📁 <b>Upload</b> a file (audio/video). Larger files use more processing.
           </li>
           <li>
-            Results appear inside the thread: you’ll see tabs like <b>Transcription</b>, <b>Translation</b>, and{" "}
+            🧾 Results appear inside the thread: you’ll see tabs like <b>Transcription</b>, <b>Translation</b>, and{" "}
             <b>Summary</b>.
           </li>
           <li>
-            Export your work with buttons like <b>Download SRT</b> / <b>Copy</b> / <b>Save</b>.
+            📤 Export your work with buttons like <b>Download SRT</b> / <b>Copy</b> / <b>Save</b>.
           </li>
         </List>
 
@@ -102,9 +160,7 @@ export default function TutorialThread() {
         </P>
 
         <List>
-          <li>
-            Your token balance is shown in the sidebar under your profile.
-          </li>
+          <li>Your token balance is shown in the sidebar under your profile.</li>
           <li>
             When a job runs, tokens can show as <b>in use</b> while it’s processing.
           </li>
@@ -113,48 +169,26 @@ export default function TutorialThread() {
           </li>
         </List>
 
-        <Note>
-          You can start as a guest to explore, then sign in to keep your history and manage plans.
-        </Note>
+        <Note>You can start as a guest to explore, then sign in to keep your history and manage plans.</Note>
       </Card>
 
       <Card>
         <H3>Guest vs. signed-in</H3>
         <List>
           <li>
-            <b>Guest mode</b> is great for trying the app quickly.
+            👤 <b>Guest mode</b> is great for trying the app quickly.
           </li>
           <li>
-            <b>Sign in with Google</b> to keep your threads synced and persist your work across devices.
+            🔐 <b>Sign in with Google</b> to keep your threads synced and persist your work across devices.
           </li>
           <li>
-            Once signed in, you can manage your plan and token limits from the sidebar.
+            ⚙️ Once signed in, you can manage your plan and token limits from the sidebar.
           </li>
         </List>
 
         <Hint>
           Privacy note: this app is built to be creator-friendly. You control what you upload and what you export.
         </Hint>
-      </Card>
-
-      <Card>
-        <H3>Open source</H3>
-        <P>
-          HappySRT is fully open source—feel free to fork it, self-host it, and contribute improvements.
-        </P>
-
-        <List>
-          <li>Found a bug? Open an issue.</li>
-          <li>Want a feature? Suggest it (or ship a PR).</li>
-          <li>Using it in production? A ⭐ helps others discover it.</li>
-        </List>
-
-        <LinkRow>
-          <GitHubLink href={GITHUB_REPO_LINK} target="_blank" rel="noreferrer">
-            Open the repo →
-          </GitHubLink>
-          <Muted>Thanks for supporting open source.</Muted>
-        </LinkRow>
       </Card>
     </Thread>
   );
@@ -189,8 +223,8 @@ const Pill = styled.div`
   font-weight: 900;
   padding: 4px 10px;
   border-radius: 999px;
-  border: 1px solid rgba(239, 68, 68, 0.22);
-  background: rgba(239, 68, 68, 0.08);
+  border: 1px solid rgba(59, 130, 246, 0.22);
+  background: rgba(59, 130, 246, 0.10);
   color: var(--accent);
 `;
 
@@ -238,33 +272,80 @@ const Note = styled.div`
   line-height: 1.45;
 `;
 
-const LinkRow = styled.div`
+const MiniSteps = styled.div`
   margin-top: 12px;
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  flex-wrap: wrap;
+  display: grid;
+  gap: 8px;
 `;
 
-const GitHubLink = styled.a`
+const MiniStep = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(0, 0, 0, 0.10);
+  background: rgba(0, 0, 0, 0.02);
+  color: var(--text);
+`;
+
+const Dot = styled.div`
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
   font-size: 12px;
   font-weight: 950;
   color: var(--text);
-  text-decoration: none;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  background: rgba(0, 0, 0, 0.03);
+`;
 
-  border-radius: 12px;
-  padding: 8px 10px;
+const Gallery = styled.div`
+  margin-top: 12px;
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding-bottom: 6px;
+  scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch;
 
-  border: 1px solid rgba(0, 0, 0, 0.10);
-  background: rgba(0, 0, 0, 0.02);
-
-  &:hover {
-    background: var(--hover);
+  &::-webkit-scrollbar {
+    height: 10px;
   }
 `;
 
-const Muted = styled.span`
+const Shot = styled.div`
+  flex: 0 0 240px;
+  scroll-snap-align: start;
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.02);
+  overflow: hidden;
+`;
+
+const ShotImg = styled.img`
+  width: 100%;
+  height: auto;
+  display: block;
+  aspect-ratio: 1080 / 2316;
+  object-fit: cover;
+`;
+
+const ShotMeta = styled.div`
+  padding: 10px 12px 12px;
+`;
+
+const ShotTitle = styled.div`
+  font-size: 12px;
+  font-weight: 950;
+  color: var(--text);
+`;
+
+const ShotDesc = styled.div`
+  margin-top: 2px;
   font-size: 12px;
   color: var(--muted);
-  font-weight: 800;
+  line-height: 1.35;
 `;
