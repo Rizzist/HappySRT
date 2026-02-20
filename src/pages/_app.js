@@ -43,7 +43,6 @@ export default function App({ Component, pageProps }) {
               defer 
               data-website-id="dfid_xqVIlCaGEnOvUZxpsNuLc" 
               data-domain="happysrt.com" 
-              data-allow-localhost="true"
               src="https://datafa.st/js/script.js"> 
               </Script>
           <Component {...pageProps} />
