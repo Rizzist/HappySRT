@@ -24,6 +24,9 @@ const SCREENSHOTS = [
   },
 ];
 
+const DEMO_VIDEO_URL = "https://www.youtube.com/watch?v=OhdngwENckY";
+const DEMO_EMBED_URL = "https://www.youtube-nocookie.com/embed/OhdngwENckY";
+
 export default function TutorialThread() {
   return (
     <Thread>
@@ -88,6 +91,30 @@ export default function TutorialThread() {
             </Shot>
           ))}
         </Gallery>
+
+        <VideoBlock aria-label="HappySRT demo video">
+          <VideoHeader>
+            <H3 style={{ margin: 0 }}>Watch the demo 🎥</H3>
+            <VideoLink href={DEMO_VIDEO_URL} target="_blank" rel="noreferrer">
+              Open on YouTube →
+            </VideoLink>
+          </VideoHeader>
+
+          <VideoWrap>
+            <Iframe
+              src={DEMO_EMBED_URL}
+              title="HappySRT demo video"
+              loading="lazy"
+              frameBorder="0"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+              allowFullScreen
+            />
+          </VideoWrap>
+
+          <Hint style={{ marginTop: 10 }}>
+            Tip: If the embed is blocked in your environment, use <b>Open on YouTube</b>.
+          </Hint>
+        </VideoBlock>
 
         <Note>
           Tip: If you’re on desktop, you can also scroll the gallery horizontally with <b>Shift + mouse wheel</b>.
@@ -348,4 +375,53 @@ const ShotDesc = styled.div`
   font-size: 12px;
   color: var(--muted);
   line-height: 1.35;
+`;
+
+const VideoBlock = styled.div`
+  margin-top: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(0, 0, 0, 0.10);
+  background: rgba(0, 0, 0, 0.02);
+  padding: 12px;
+`;
+
+const VideoHeader = styled.div`
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+`;
+
+const VideoLink = styled.a`
+  font-size: 12px;
+  font-weight: 950;
+  color: var(--text);
+  text-decoration: none;
+
+  border-radius: 12px;
+  padding: 8px 10px;
+  border: 1px solid rgba(0, 0, 0, 0.10);
+  background: rgba(0, 0, 0, 0.02);
+
+  &:hover {
+    background: var(--hover);
+  }
+`;
+
+const VideoWrap = styled.div`
+  width: 100%;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.06);
+  aspect-ratio: 16 / 9;
+`;
+
+const Iframe = styled.iframe`
+  width: 100%;
+  height: 100%;
+  display: block;
+  border: 0;
 `;
