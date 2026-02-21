@@ -70,7 +70,7 @@ function reportGoogleAdsPurchaseClick({ value = 1, currency = "CAD", transaction
 
     try {
       window.gtag("event", "conversion", {
-        send_to: "AW-11294496559/hWzECNPzpfwbEK-u0Ykq",
+        send_to: "AW-11294496559/g3ypCN6WpvwbEK-u0Ykq",
         value: Number(value) || 1,
         currency: String(currency || "CAD"),
         transaction_id: String(transactionId || ""),
