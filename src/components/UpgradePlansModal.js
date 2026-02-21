@@ -49,6 +49,42 @@ function getPlanIcon(planKey) {
 
 
 
+function reportGoogleAdsPurchaseClick({ value = 1, currency = "CAD", transactionId = "" } = {}) {
+  if (typeof window === "undefined") return Promise.resolve();
+
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+
+    // Fallback in case gtag is blocked / callback never fires
+    const timeout = window.setTimeout(finish, 900);
+
+    if (typeof window.gtag !== "function") {
+      finish();
+      return;
+    }
+
+    try {
+      window.gtag("event", "conversion", {
+        send_to: "AW-11294496559/hWzECNPzpfwbEK-u0Ykq",
+        value: Number(value) || 1,
+        currency: String(currency || "CAD"),
+        transaction_id: String(transactionId || ""),
+        event_callback: () => {
+          window.clearTimeout(timeout);
+          finish();
+        },
+      });
+    } catch {
+      window.clearTimeout(timeout);
+      finish();
+    }
+  });
+}
 
 
 
@@ -237,13 +273,19 @@ export default function UpgradePlansModal({ open, onClose, onSelectPlan, busyPla
                       type="button"
                       disabled={ctaDisabled}
                       $primary={recommended}
-                      onClick={() => {
+                      onClick={async () => {
                         if (isCurrentPlan) return;
 
                         if (!canCheckout) {
                           toast("This plan isn’t purchasable yet (missing Stripe priceIdMonthly).");
                           return;
                         }
+
+                        await reportGoogleAdsPurchaseClick({
+                        value: Number(p.priceUsdMonthly) || 1,
+                        currency: "USD",
+                        transactionId: "", // leave blank here (click event); fill on real purchase success later
+                        });
 
                         onSelectPlan?.(p.key);
                       }}
