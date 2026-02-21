@@ -38,6 +38,21 @@ export default function App({ Component, pageProps }) {
               <link rel="manifest" href="/manifest.json" />
               <meta name="theme-color" content="#ffffff" />
               <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+  <script
+    async
+    src="https://www.googletagmanager.com/gtag/js?id=G-GX5EHBFBN5"
+  ></script>
+
+  <script
+    dangerouslySetInnerHTML={{
+      __html: `
+        window.dataLayer = window.dataLayer || [];
+        function gtag(){dataLayer.push(arguments);}
+        gtag('js', new Date());
+        gtag('config', 'G-GX5EHBFBN5');
+      `,
+    }}
+  />
             </Head>
             <Script
               defer 
