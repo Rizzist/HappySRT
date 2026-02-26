@@ -1,0 +1,14 @@
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.happysrt.www.twa",
+      "sha256_cert_fingerprints": [
+        "ED:CC:6E:61:57:47:21:08:87:80:BE:BC:7C:69:58:0C:ED:9A:7F:36:AC:DC:AC:28:68:CC:51:2C:7F:CE:4B:07"
+      ]
+    }
+  }
+]
