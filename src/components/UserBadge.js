@@ -4,6 +4,7 @@ import { useMemo, useRef, useState, useEffect } from "react";
 import { toast } from "sonner";
 import { onUpgradeRequested } from "../lib/upgradeBus"; // ✅ add
 import { useAuth } from "../contexts/AuthContext";
+import AuthDialog from "./AuthDialog";
 
 function firstAlphaNumChar(str) {
   if (!str) return "";
@@ -60,28 +61,39 @@ function prettyPlanName(planName, planKey) {
   return k || "free";
 }
 
+function prettyProviderBadge(provider, isAnonymous) {
+  if (isAnonymous) return "guest";
+
+  const p = String(provider || "").toLowerCase().trim();
+  if (!p) return "email";
+  if (p.includes("google")) return "google";
+  if (p.includes("email")) return "email";
+
+  return p;
+}
+
 export default function UserBadge({ onStartCheckout, onOpenUpgrade }) {
-  const {
-    user,
-    isAnonymous,
-    loginWithGoogle,
-    logout,
+const {
+  user,
+  isAnonymous,
+  authProvider,
+  loginWithGoogle,
+  logout,
 
-    // tokens
-    mediaTokens,
-    pendingMediaTokens,
-    tokensHydrated,
+  mediaTokens,
+  pendingMediaTokens,
+  tokensHydrated,
 
-    // billing
-    planKey,
-    planName,
-  } = useAuth();
+  planKey,
+  planName,
+} = useAuth();
+const [authOpen, setAuthOpen] = useState(false);
 
   const avatarUrl = user?.prefs?.avatarUrl || "";
   const initials = getInitials(user);
 
   const displayName = isAnonymous ? "Guest" : user?.name?.trim() || "User";
-  const providerBadge = isAnonymous ? "free" : "google";
+const providerBadge = prettyProviderBadge(authProvider, isAnonymous);
 
   const pending = Math.max(0, Number(pendingMediaTokens || 0) || 0);
   const available = Math.max(0, Number(mediaTokens || 0) || 0);
@@ -187,11 +199,17 @@ export default function UserBadge({ onStartCheckout, onOpenUpgrade }) {
           </Pills>
 
         <Actions>
-          {isAnonymous ? (
-            <PrimaryButton type="button" onClick={loginWithGoogle}>
-              Continue with Google
-            </PrimaryButton>
-          ) : (
+{isAnonymous ? (
+  <>
+      <PrimaryButton type="button" onClick={loginWithGoogle}>
+      Continue with Google
+    </PrimaryButton>
+
+    <SecondaryButton type="button" onClick={() => setAuthOpen(true)}>
+      Sign in with email
+    </SecondaryButton>
+  </>
+) : (
             <PlanButton
               type="button"
               onClick={onPlanClick}
@@ -209,6 +227,7 @@ export default function UserBadge({ onStartCheckout, onOpenUpgrade }) {
           )}
         </Actions>
       </Meta>
+      <AuthDialog open={authOpen} onClose={() => setAuthOpen(false)} />
     </Wrap>
   );
 }
@@ -353,6 +372,21 @@ const PrimaryButton = styled.button`
 
   &:hover {
     background: rgba(239, 68, 68, 0.12);
+  }
+`;
+
+const SecondaryButton = styled.button`
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-weight: 800;
+  border-radius: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+
+  &:hover {
+    background: var(--hover);
   }
 `;
 

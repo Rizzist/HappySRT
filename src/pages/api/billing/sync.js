@@ -53,23 +53,44 @@ function planInfoFromPlan(plan, fallbackKey) {
   };
 }
 
-async function loadSubscriptionFromCheckoutSession(sessionId) {
+async function loadSubscriptionFromCheckoutSession(sessionId, uid, userEmail) {
   if (!sessionId) return null;
 
   const sess = await stripe.checkout.sessions.retrieve(sessionId, {
-    expand: ["subscription", "line_items"],
+    expand: ["subscription", "line_items", "customer"],
   });
 
   if (!sess) return null;
 
-  if (sess.subscription && typeof sess.subscription === "object") return sess.subscription;
+  const sessionUserId = String(
+    sess?.metadata?.userId || sess?.client_reference_id || ""
+  ).trim();
 
-  if (typeof sess.subscription === "string" && sess.subscription) {
-    const sub = await stripe.subscriptions.retrieve(sess.subscription);
-    return sub || null;
+  const sessionEmail = String(
+    sess?.customer_details?.email || sess?.customer_email || ""
+  )
+    .trim()
+    .toLowerCase();
+
+  const authEmail = String(userEmail || "").trim().toLowerCase();
+
+  if (sessionUserId && sessionUserId !== uid) return null;
+  if (!sessionUserId && authEmail && sessionEmail && sessionEmail !== authEmail) return null;
+
+  let sub = null;
+
+  if (sess.subscription && typeof sess.subscription === "object") {
+    sub = sess.subscription;
+  } else if (typeof sess.subscription === "string" && sess.subscription) {
+    sub = await stripe.subscriptions.retrieve(sess.subscription);
   }
 
-  return null;
+  if (!sub) return null;
+
+  const subUserId = String(sub?.metadata?.userId || "").trim();
+  if (subUserId && subUserId !== uid) return null;
+
+  return sub;
 }
 
 async function searchBestSubscriptionForUser(uid) {
@@ -116,7 +137,13 @@ export default async function handler(req, res) {
 
     // 1) Find subscription (prefer checkout session)
     let sub = null;
-    if (sessionId) sub = await loadSubscriptionFromCheckoutSession(sessionId);
+if (sessionId) {
+  sub = await loadSubscriptionFromCheckoutSession(
+    sessionId,
+    uid,
+    auth?.user?.email || ""
+  );
+}
     if (!sub) sub = await searchBestSubscriptionForUser(uid);
 
     // 2) Determine planKey

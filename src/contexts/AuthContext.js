@@ -90,9 +90,10 @@ export function AuthProvider({ children }) {
   const tokensFetchRef = useRef({ inflight: null, at: 0 });
   const billingSyncRef = useRef({ inflight: null, at: 0, key: "", lastData: null });
 
-  const [user, setUser] = useState(null);
-  const [loadingAuth, setLoadingAuth] = useState(true);
-  const [isAnonymous, setIsAnonymous] = useState(true);
+const [user, setUser] = useState(null);
+const [loadingAuth, setLoadingAuth] = useState(true);
+const [isAnonymous, setIsAnonymous] = useState(true);
+const [authProvider, setAuthProvider] = useState("anonymous");
 
   // ✅ indicates whether we have received at least one authoritative server token snapshot
   const [tokensHydrated, setTokensHydrated] = useState(false);
@@ -230,23 +231,29 @@ const applyTokensSnapshot = useCallback((snap) => {
 }, [getAccount]);
 
 
-  const refreshUser = useCallback(async () => {
-    const account = getAccount();
-    try {
-      const u = await account.get();
-      setUser(u || null);
-      const s = await account.getSession("current").catch(() => null);
-      const provider = String(s?.provider || "").toLowerCase().trim();
-      const anon = provider === "anonymous";
-      setIsAnonymous(anon || !u?.$id);
+const refreshUser = useCallback(async () => {
+  const account = getAccount();
 
-      return u || null;
-    } catch {
-      setUser(null);
-      setIsAnonymous(true);
-      return null;
-    }
-  }, [getAccount]);
+  try {
+    const u = await account.get();
+    setUser(u || null);
+
+    const s = await account.getSession("current").catch(() => null);
+    const provider = getProviderFromSession(s) || (u?.email ? "email" : "");
+    const anon = provider === "anonymous";
+
+    setAuthProvider(provider || (anon ? "anonymous" : "email"));
+    setIsAnonymous(anon || !u?.$id);
+
+    return u || null;
+  } catch {
+    setUser(null);
+    setAuthProvider("anonymous");
+    setIsAnonymous(true);
+    return null;
+  }
+}, [getAccount]);
+
 
 const getJwt = useCallback(async ({ force } = {}) => {
   if (typeof window === "undefined") return null;
@@ -285,21 +292,74 @@ const getJwt = useCallback(async ({ force } = {}) => {
     return String(s?.provider || "").toLowerCase().trim();
   }
 
-  const loginWithGoogle = useCallback(async () => {
-    if (typeof window === "undefined") return;
+  const resetClientAuthCaches = useCallback(() => {
+  jwtCacheRef.current = { jwt: null, at: 0 };
+  tokensFetchRef.current = { inflight: null, at: 0 };
+  billingSyncRef.current = { inflight: null, at: 0, key: "", lastData: null };
+}, []);
 
+const clearAnonymousCurrentSession = useCallback(async () => {
+  const account = getAccount();
+
+  try {
+    const s = await account.getSession("current");
+    if (getProviderFromSession(s) === "anonymous") {
+      await account.deleteSession("current");
+    }
+  } catch {}
+}, [getAccount]);
+
+
+
+
+const sendPasswordRecovery = useCallback(
+  async (email, url) => {
     const account = getAccount();
-    const origin = window.location.origin;
+    const cleanEmail = String(email || "").trim();
+    const recoveryUrl =
+      String(url || "").trim() ||
+      (typeof window !== "undefined" ? `${window.location.origin}/reset-password` : "");
 
-    try {
-      const s = await account.getSession("current");
-      if (getProviderFromSession(s) === "anonymous") {
-        await account.deleteSession("current");
-      }
-    } catch {}
+    if (!cleanEmail) throw new Error("Email is required.");
+    if (!recoveryUrl) throw new Error("Recovery URL is missing.");
 
-    account.createOAuth2Session("google", origin, origin);
-  }, [getAccount]);
+    return account.createRecovery({
+      email: cleanEmail,
+      url: recoveryUrl,
+    });
+  },
+  [getAccount]
+);
+
+const completePasswordRecovery = useCallback(
+  async ({ userId, secret, password }) => {
+    const account = getAccount();
+
+    const uid = String(userId || "").trim();
+    const s = String(secret || "").trim();
+    const nextPassword = String(password || "");
+
+    if (!uid || !s) throw new Error("Invalid or expired reset link.");
+    if (!nextPassword) throw new Error("Password is required.");
+
+    return account.updateRecovery({
+      userId: uid,
+      secret: s,
+      password: nextPassword,
+    });
+  },
+  [getAccount]
+);
+
+const loginWithGoogle = useCallback(async () => {
+  if (typeof window === "undefined") return;
+
+  const account = getAccount();
+  const origin = window.location.origin;
+
+  await clearAnonymousCurrentSession();
+  account.createOAuth2Session("google", origin, origin);
+}, [getAccount, clearAnonymousCurrentSession]);
 
   // Throttled tokens refresh
 const refreshTokens = useCallback(async ({ forceJwt, force } = {}) => {
@@ -326,6 +386,65 @@ const refreshTokens = useCallback(async ({ forceJwt, force } = {}) => {
     tokensFetchRef.current = { inflight: null, at: Date.now() };
   }
 }, [getJwt, applyTokensSnapshot]);
+
+
+const hydrateAfterPrimaryLogin = useCallback(async () => {
+  resetClientAuthCaches();
+  setTokensHydrated(false);
+  setOptimisticReservedByKey({});
+
+  const u = await refreshUser();
+
+  if (u?.$id) {
+    await refreshTokens({ forceJwt: true, force: true }).catch(() => null);
+  }
+
+  return u;
+}, [resetClientAuthCaches, refreshUser, refreshTokens]);
+
+
+const loginWithEmailPassword = useCallback(
+  async (email, password) => {
+    const cleanEmail = String(email || "").trim();
+    const cleanPassword = String(password || "");
+
+    if (!cleanEmail) throw new Error("Email is required.");
+    if (!cleanPassword) throw new Error("Password is required.");
+
+    const account = getAccount();
+    const restoreAnonOnFailure = isAnonymous;
+
+    try {
+      await clearAnonymousCurrentSession();
+
+      await account.createEmailPasswordSession({
+        email: cleanEmail,
+        password: cleanPassword,
+      });
+
+      await hydrateAfterPrimaryLogin();
+      return true;
+    } catch (err) {
+      if (restoreAnonOnFailure) {
+        try {
+          await ensureSession();
+          await refreshUser();
+          await refreshTokens({ forceJwt: true, force: true }).catch(() => null);
+        } catch {}
+      }
+      throw err;
+    }
+  },
+  [
+    getAccount,
+    isAnonymous,
+    clearAnonymousCurrentSession,
+    hydrateAfterPrimaryLogin,
+    ensureSession,
+    refreshUser,
+    refreshTokens,
+  ]
+);
 
 
   // Stripe billing sync (throttled)
@@ -460,6 +579,7 @@ const logout = useCallback(async () => {
 
   setUser(null);
   setIsAnonymous(true);
+  setAuthProvider("anonymous");
   setTokensHydrated(false);
   setOptimisticReservedByKey({});
 
@@ -504,62 +624,68 @@ const logout = useCallback(async () => {
     tokensHydrated: !!tokensHydrated,
   };
 
-  const value = useMemo(() => {
-    const serverReserved = Number(tokens.mediaTokensReserved || 0) || 0;
+const value = useMemo(() => {
+  const serverReserved = Number(tokens.mediaTokensReserved || 0) || 0;
 
-    return {
-      user,
-      loading: loadingAuth,
-      loadingAuth,
-      isAnonymous,
-
-      // ✅ plan/billing info
-      billing,
-      planKey: billing.planKey,
-      planName: billing.planName,
-      monthlyFloor: billing.monthlyFloor,
-
-      // ✅ tokens hydration
-      tokensHydrated,
-
-      loginWithGoogle,
-
-      getJwt,
-      refreshUser,
-      refreshTokens,
-      syncBilling,
-      applyTokensSnapshot,
-
-      tokens,
-      mediaTokens: tokens.mediaTokens,
-      tokenSnapshot,
-
-      pendingMediaTokens: Math.max(0, serverReserved + optimisticReserved),
-
-      reserveMediaTokens,
-      releaseMediaTokens,
-      clearAllMediaReservations,
-
-      optimisticReserved,
-
-      logout,
-    };
-  }, [
+  return {
     user,
+    loading: loadingAuth,
     loadingAuth,
     isAnonymous,
+    authProvider,
+
     billing,
+    planKey: billing.planKey,
+    planName: billing.planName,
+    monthlyFloor: billing.monthlyFloor,
+
     tokensHydrated,
-    tokens,
-    optimisticReserved,
+
     loginWithGoogle,
+    loginWithEmailPassword,
+    sendPasswordRecovery,
+    completePasswordRecovery,
+
     getJwt,
     refreshUser,
     refreshTokens,
     syncBilling,
     applyTokensSnapshot,
+
+    tokens,
+    mediaTokens: tokens.mediaTokens,
+    tokenSnapshot,
+
+    pendingMediaTokens: Math.max(0, serverReserved + optimisticReserved),
+
+    reserveMediaTokens,
+    releaseMediaTokens,
+    clearAllMediaReservations,
+
+    optimisticReserved,
+
     logout,
-  ]);
+  };
+}, [
+  user,
+  loadingAuth,
+  isAnonymous,
+  authProvider,
+  billing,
+  tokensHydrated,
+  tokens,
+  optimisticReserved,
+  loginWithGoogle,
+  loginWithEmailPassword,
+  sendPasswordRecovery,
+  completePasswordRecovery,
+  getJwt,
+  refreshUser,
+  refreshTokens,
+  syncBilling,
+  applyTokensSnapshot,
+  logout,
+]);
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
